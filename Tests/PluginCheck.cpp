@@ -78,10 +78,41 @@ void click(juce::Component& component, float frequency, int clicks, bool right =
     else component.mouseDown(event);
 }
 
+void checkAutomatedBandLayout()
+{
+    GranularProcessor processor;
+    processor.setValue("bands", 3);
+    processor.setValue("split0", 6000);
+    processor.setValue("split1", 200);
+    processor.moveSplit(0, 300);
+    check(processor.value("split0") == 6000 && processor.value("split1") == 300,
+          "Dragging a reordered crossover changed the wrong parameter");
+    processor.moveSplit(1, 7000);
+    check(processor.value("split0") == 7000 && processor.value("split1") == 300,
+          "Dragging the upper reordered crossover changed another divider");
+
+    processor.prepareToPlay(48000, 256);
+    juce::AudioBuffer<float> audio(2, 256); juce::MidiBuffer midi;
+    auto process = [&] { audio.clear(); processor.processBlock(audio, midi); };
+    processor.toggleBandListen(0);
+    process();
+    check(processor.listenedBand() == 0, "Unchanged band layout cleared band audition");
+    processor.setValue("bands", 4);
+    process();
+    check(processor.listenedBand() == -1, "Automated band insertion left audition active");
+    processor.toggleModuleSolo(1);
+    process();
+    check(processor.soloedModule() == 1, "Unchanged band layout cleared module solo");
+    processor.setValue("bands", 2);
+    process();
+    check(processor.soloedModule() == -1, "Automated band removal left module solo active");
+}
+
 int runChecks(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI initialise;
     if (argc < 2) return 1;
+    checkAutomatedBandLayout();
     checkCrossovers();
     juce::VST3PluginFormat format;
     juce::OwnedArray<juce::PluginDescription> descriptions;
@@ -495,6 +526,16 @@ int runChecks(int argc, char** argv)
     auto* grainsPage = dynamic_cast<juce::TextButton*>(findComponent(*editor, "grainsPage"));
     check(playbackPage && grainsPage, "Playback panel selector missing");
     playbackPage->onClick();
+    const float connectionsBeforeHiddenDrop = direct->value("mod2_connections");
+    patch(0, -1); // Grain size socket is hidden on the Playback page.
+    check(direct->value("mod2_connections") == connectionsBeforeHiddenDrop,
+          "A cable connected to a hidden grain control");
+    patch(16, -1); // Position socket is visible on the Playback page.
+    check(direct->value("mod2_connections") == connectionsBeforeHiddenDrop + 1
+          && direct->value("mod2_link2_target") == 16,
+          "A cable could not connect to a visible playback control");
+    direct->setValue("mod2_connections", connectionsBeforeHiddenDrop);
+    pumpMessages(50);
     const std::array<float, 5> playbackValues {300, 350, -7, 45, 70};
     for (int i = 0; i < 5; ++i)
     {

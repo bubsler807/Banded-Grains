@@ -41,6 +41,7 @@ GranularProcessor::GranularProcessor()
 }
 void GranularProcessor::prepareToPlay(double rate, int)
 {
+    processedBandCount = bandCount();
     displayRate.store(static_cast<float>(rate));
     splitter.prepare(rate);
     for (int slot = 0; slot < maxModulators; ++slot)
@@ -78,6 +79,11 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
     juce::ScopedNoDenormals noDenormals;
     const int channels = getTotalNumInputChannels();
     const int bands = juce::jlimit(1, maxBands, juce::roundToInt(countControl->load()));
+    if (bands != processedBandCount)
+    {
+        auditionSource.store(-1);
+        processedBandCount = bands;
+    }
     double bpm = 120;
     bool advanceModulation = true;
     if (auto* playHead = getPlayHead())
@@ -292,11 +298,22 @@ void GranularProcessor::removeSplit(int index)
 }
 void GranularProcessor::moveSplit(int index, float frequency)
 {
-    if (index < 0 || index >= bandCount() - 1) return;
-    const auto splits = boundaries();
-    const float low = index == 0 ? 30.0f : splits[index - 1] * 1.08f;
-    const float high = index == bandCount() - 2 ? displayMaxFrequency() * 0.95f : splits[index + 1] / 1.08f;
-    if (low < high) setValue("split" + juce::String(index), juce::jlimit(low, high, frequency));
+    const int count = bandCount();
+    if (index < 0 || index >= count - 1) return;
+    // Automation can reorder the parameter values. Map the displayed divider
+    // back to its parameter rather than treating its sorted position as its ID.
+    std::array<int, maxSplits> order;
+    std::array<float, maxSplits> frequencies;
+    for (int i = 0; i < maxSplits; ++i)
+    {
+        order[i] = i;
+        frequencies[i] = splitControls[i]->load();
+    }
+    std::sort(order.begin(), order.begin() + count - 1, [&](int a, int b)
+    { return frequencies[a] == frequencies[b] ? a < b : frequencies[a] < frequencies[b]; });
+    const float low = index == 0 ? 30.0f : frequencies[order[index - 1]] * 1.08f;
+    const float high = index == count - 2 ? displayMaxFrequency() * 0.95f : frequencies[order[index + 1]] / 1.08f;
+    if (low < high) setValue("split" + juce::String(order[index]), juce::jlimit(low, high, frequency));
 }
 juce::AudioProcessorEditor* GranularProcessor::createEditor() { return new GranularEditor(*this); }
 double GranularProcessor::getTailLengthSeconds() const

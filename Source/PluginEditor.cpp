@@ -366,7 +366,8 @@ public:
         if (!isOutput || owner.draggingSource < 0) return;
         const auto end = e.getEventRelativeTo(&owner).position;
         for (int target = 0; target < GranularProcessor::modTargetCount; ++target)
-            if (owner.inputSockets[target]->getBounds().toFloat().expanded(7).contains(end))
+            if (owner.inputSockets[target]->isVisible()
+                && owner.inputSockets[target]->getBounds().toFloat().expanded(7).contains(end))
             { owner.connectModulator(number, target); break; }
         owner.draggingSource = -1;
         owner.repaint();
@@ -713,7 +714,7 @@ void GranularEditor::timerCallback()
     const int modCount = juce::roundToInt(processor.value("modCount"));
     const int links = modCount > 0 ? juce::roundToInt(processor.value(GranularProcessor::modID(juce::jmin(selectedSource, modCount - 1), "connections"))) : 0;
     if (modCount != shownModCount || links != shownConnections) refreshModulation();
-    modRate.setEnabled(modSync.getSelectedItemIndex() == 0);
+    modRate.setEnabled(modCount > 0 && modSync.getSelectedItemIndex() == 0);
     envelope->repaint();
     grainView->update();
     repaint();

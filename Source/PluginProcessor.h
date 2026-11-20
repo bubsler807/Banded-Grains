@@ -82,6 +82,7 @@ private:
     std::array<juce::SmoothedValue<float>, maxBands> listenGains;
     juce::SmoothedValue<float> mainGain;
     std::atomic<int> auditionSource {-1};
+    int processedBandCount = 1;
     std::array<juce::SmoothedValue<float>, maxBands> moduleSoloGains;
     std::array<std::array<juce::SmoothedValue<float>, maxBands>, maxBands> sends;
     BandSplitter splitter;
