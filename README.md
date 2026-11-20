@@ -64,15 +64,29 @@ The spectrum displays the incoming audio before granular processing. Modules con
 
 ## Modulation
 
-Up to four shared LFOs can modulate controls across all modules. Each LFO supports four connections, with a separate destination and minimum/maximum range for each connection.
+Up to four shared modulators (LFO or Random) can modulate controls across all modules. Each source supports four connections, with a separate destination and signed depth for each connection. Source polarity can be unipolar (0 to 1), bipolar (-1 to +1), or inverted (1 to 0).
 
-Available waveforms are sine, triangle, ramp up, ramp down, square, and random hold. LFOs run at 0.02-20 Hz or follow tempo-based cycles from a sixteenth note to 16 beats.
+LFO waveforms are sine, triangle, ramp up, ramp down, square, and random hold. LFOs run at 0.02-20 Hz or follow tempo-based cycles from a sixteenth note to 16 beats.
 
-To connect an LFO, drag its output socket onto a control's input socket. Hover a module tab while dragging to switch modules. Hover a socket to display its cables, or click a connected input to select its connection. Connection ranges can be typed in the destination control's units; reversing the endpoints reverses the modulation.
+To connect a modulator, drag its output socket onto a control's input socket. Hover a module tab while dragging to switch modules. Hover a socket to display its cables, or click a connected input to select its connection. Each new connection has a signed depth, shown and editable in the destination control's units. New connections start at zero depth. Positive depth raises the value as the source rises; negative depth lowers it.
 
-Modulation acts on the processing value without changing the underlying knob or DAW automation value. If several connections target the same control, the last connection in source/connection order takes priority.
+Connected input sockets show the resulting value with a small moving indicator. Modulation acts on the processing value without changing the underlying knob or DAW automation value. Contributions from all connections targeting a control are added to its base value, then the result is limited and rounded to the control's allowed range. A depth of 100% in DAW automation represents the full destination range; for pitch, 25% is 12 semitones. Bipolar sources move above and below the base setting.
 
-Tempo-based LFOs pause when the host reports stopped transport and use 120 BPM if host tempo is unavailable. They follow the tempo without locking their phase to the DAW timeline.
+The dedicated **Random** type has Rate, tempo sync, Smooth, Jitter, and Chaos controls. Smooth blends between values; Jitter varies their timing; Chaos limits each change. At zero Chaos the target holds. Each source has an independent deterministic sequence, reset on playback preparation. Random uses the same connections, signed depths, and polarity as LFOs.
+
+Tempo-based modulators pause when the host reports stopped transport and use 120 BPM if host tempo is unavailable. They follow the tempo without locking their phase to the DAW timeline.
+
+## Effects lanes
+
+The **Effects** page provides an independent lane for every active frequency band and a **Master** lane. Select a lane from the dropdown. Band lanes process audio after the crossover and before routing to granular modules; Master processes the combined granular output. Band audition remains a pre-effects monitor.
+
+Click the empty lane or **+ Add effect** to open a picker, then choose **Distortion**, **Reverb**, or **3-Band EQ**. Effects appear as a scrollable top-to-bottom list and process audio in that order. Each lane supports up to eight inserts, including repeated instances of the same effect. Each card has its own On switch, Remove button, and Up/Down controls for reordering. The lane has its own dry/wet and output gain.
+
+Distortion uses a simple soft-clipping waveshaper with Drive and Mix. Reverb provides Room size, Damping, Mix, and Width. The 3-Band EQ has low and high shelves at 250 Hz and 4 kHz, a mid bell at 1 kHz, gains from -18 to +18 dB, and Mix. New lanes start empty; added effects start enabled, with reverb Mix at 25% and the EQ gains flat.
+
+Effect controls support DAW automation and session recall; they are not destinations in the internal modulation system yet. Reverb buffers reset on preparation, state recall, and band insertion/removal. Moving or removing an effect resets the affected insert buffers.
+
+Adding a split copies the lower band's effects into the new band; existing higher bands keep their settings. Removing a split retains the lower band's effects and shifts higher lanes along with their bands. Changing the band count directly through automation retains settings by band slot.
 
 ## Processing notes
 

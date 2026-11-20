@@ -23,11 +23,12 @@ GranularProcessor::GranularProcessor()
         for (int slot = 0; slot < maxModulators; ++slot)
         {
             auto pointer = [&](const char* id) { return parameters.getRawParameterValue(modID(slot, id)); };
-            modControls[slot] = {pointer("wave"), pointer("rate"), pointer("sync"), pointer("connections")};
+            modControls[slot] = {pointer("wave"), pointer("rate"), pointer("sync"), pointer("connections"), pointer("polarity"),
+                pointer("type"), pointer("smooth"), pointer("jitter"), pointer("chaos")};
             for (int link = 0; link < maxConnections; ++link)
             {
                 auto connection = [&](const char* id) { return parameters.getRawParameterValue(connectionID(slot, link, id)); };
-                modConnections[slot][link] = {connection("module"), connection("target"), connection("min"), connection("max")};
+                modConnections[slot][link] = {connection("module"), connection("target"), connection("depth")};
             }
         }
         for (int i = 0; i < 4; ++i)
@@ -38,6 +39,17 @@ GranularProcessor::GranularProcessor()
     }
     for (int i = 0; i < maxSplits; ++i) splitControls[i] = parameters.getRawParameterValue("split" + juce::String(i));
     countControl = parameters.getRawParameterValue("bands");
+    for (int lane = 0; lane < effectLaneCount; ++lane)
+    {
+        for (int i = 0; i < static_cast<int>(effectControls.size()); ++i)
+            effectParameters[lane][i] = parameters.getRawParameterValue(effectID(lane, effectControls[i]));
+        for (int slot = 0; slot < maxEffectsPerLane; ++slot)
+        {
+            effectSlots[lane][slot] = std::make_unique<EffectSlot>();
+            for (int i = 0; i < static_cast<int>(effectSlotControls.size()); ++i)
+                effectSlotParameters[lane][slot][i] = parameters.getRawParameterValue(effectSlotID(lane, slot, effectSlotControls[i]));
+        }
+    }
 }
 void GranularProcessor::prepareToPlay(double rate, int)
 {
@@ -46,6 +58,18 @@ void GranularProcessor::prepareToPlay(double rate, int)
     splitter.prepare(rate);
     for (int slot = 0; slot < maxModulators; ++slot)
         modStates[slot] = {0, 0.5f, static_cast<uint32_t>(1234567 + slot * 65537)};
+    for (int slot = 0; slot < maxModulators; ++slot)
+        randomModulators[slot].prepare(rate, static_cast<uint32_t>(9876543 + slot * 65537));
+    for (int lane = 0; lane < effectLaneCount; ++lane)
+    {
+        for (auto& slot : effectSlots[lane]) slot->prepare(rate);
+        effectMix[lane].reset(rate, 0.01); effectGain[lane].reset(rate, 0.01);
+        effectMix[lane].setCurrentAndTargetValue(effectParameters[lane][1]->load() * 0.01f);
+        effectGain[lane].setCurrentAndTargetValue(juce::Decibels::decibelsToGain(effectParameters[lane][2]->load()));
+        resetEffectSlots[lane].store(0);
+    }
+    resetEffects.store(false);
+    for (auto& audio : bandAudio) audio.setSize(2, chunkSize);
     listenAudio.setSize(2, chunkSize);
     const int selected = listenedBand() < bandCount() ? listenedBand() : -1;
     mainGain.reset(rate, 0.01);
@@ -77,6 +101,13 @@ bool GranularProcessor::isBusesLayoutSupported(const BusesLayout& layout) const
 void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
+    const bool resetAllEffects = resetEffects.exchange(false);
+    for (int lane = 0; lane < effectLaneCount; ++lane)
+    {
+        const unsigned resets = resetEffectSlots[lane].exchange(0);
+        for (int slot = 0; slot < maxEffectsPerLane; ++slot)
+            if (resetAllEffects || (resets & (1u << slot)) != 0) effectSlots[lane][slot]->reset();
+    }
     const int channels = getTotalNumInputChannels();
     const int bands = juce::jlimit(1, maxBands, juce::roundToInt(countControl->load()));
     if (bands != processedBandCount)
@@ -109,6 +140,7 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
     {
         const int length = juce::jmin(chunkSize, buffer.getNumSamples() - offset);
         for (auto& audio : moduleAudio) audio.clear();
+        for (auto& audio : bandAudio) audio.clear();
         listenAudio.clear();
         std::array<float, chunkSize> mainGains;
         for (int i = 0; i < length; ++i)
@@ -126,19 +158,28 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
             mainGains[i] = mainGain.getNextValue();
             std::array<float, maxBands> audition;
             for (int band = 0; band < maxBands; ++band) audition[band] = listenGains[band].getNextValue();
-            float weights[maxBands][maxBands];
-            for (int band = 0; band < maxBands; ++band)
-                for (int m = 0; m < maxBands; ++m) weights[band][m] = sends[band][m].getNextValue();
             for (int ch = 0; ch < channels; ++ch)
             {
                 const auto sections = splitter.processSample(ch, ch == 0 ? left : right);
                 for (int band = 0; band < bands; ++band)
                     listenAudio.addSample(ch, i, sections[band] * audition[band]);
                 for (int band = 0; band < bands; ++band)
-                    for (int m = 0; m < maxBands; ++m)
-                        moduleAudio[m].addSample(ch, i, sections[band] * weights[band][m]);
+                    bandAudio[band].setSample(ch, i, sections[band]);
             }
         }
+        // Band inserts run before bands are combined into shared granular modules.
+        for (int band = 0; band < maxBands; ++band)
+            processEffectLane(band, bandAudio[band].getWritePointer(0),
+                channels > 1 ? bandAudio[band].getWritePointer(1) : nullptr, length);
+        for (int i = 0; i < length; ++i)
+            for (int band = 0; band < maxBands; ++band)
+                for (int m = 0; m < maxBands; ++m)
+                {
+                    const float weight = sends[band][m].getNextValue();
+                    if (band >= bands) continue;
+                    for (int ch = 0; ch < channels; ++ch)
+                        moduleAudio[m].addSample(ch, i, bandAudio[band].getSample(ch, i) * weight);
+                }
         std::array<float, maxModulators> modulationValues {};
         const int activeModulators = juce::jlimit(0, maxModulators, juce::roundToInt(modCount->load()));
         for (int slot = 0; slot < activeModulators; ++slot)
@@ -166,8 +207,12 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
                 case 5: wave = state.held; break;
                 default: wave = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * phase); break;
             }
+            if (mod.type->load() >= 0.5f)
+                wave = randomModulators[slot].process(sync == 0 || advanceModulation ? length : 0, hz,
+                    mod.smooth->load() * 0.01f, mod.jitter->load() * 0.01f, mod.chaos->load() * 0.01f);
             modulationValues[slot] = wave;
-            modOutputs[slot].store(wave);
+            const int polarity = juce::roundToInt(mod.polarity->load());
+            modOutputs[slot].store(polarity == 1 ? 2 * wave - 1 : polarity == 2 ? 1 - wave : wave);
         }
 
         for (int ch = 0; ch < channels; ++ch) buffer.clear(ch, offset, length);
@@ -178,6 +223,7 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
                 feedbackControls[m][0]->load(), feedbackControls[m][1]->load(), feedbackControls[m][2]->load()};
             for (int i = 0; i < 4; ++i) { values[8 + i] = pitchControls[m][i]->load(); values[12 + i] = chanceControls[m][i]->load(); }
             for (int i = 0; i < 6; ++i) values[16 + i] = playbackControls[m][i]->load();
+            std::array<float, modTargetCount> contributions {};
             for (int slot = 0; slot < activeModulators; ++slot)
             {
                 const auto& mod = modControls[slot];
@@ -188,10 +234,16 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
                     const auto& connection = modConnections[slot][link];
                     if (juce::roundToInt(connection.module->load()) != m) continue;
                     const int target = juce::jlimit(0, modTargetCount - 1, juce::roundToInt(connection.target->load()));
-                    const float minimum = connection.minimum->load() * 0.01f, maximum = connection.maximum->load() * 0.01f;
-                    values[target] = modDestinations[m][target]->convertFrom0to1(juce::jlimit(0.0f, 1.0f, minimum + wave * (maximum - minimum)));
-                    if (target >= 8 && target < 12) values[target] = std::round(values[target]);
+                    const int polarity = juce::roundToInt(mod.polarity->load());
+                    const float output = polarity == 1 ? 2 * wave - 1 : polarity == 2 ? 1 - wave : wave;
+                    const auto range = modDestinations[m][target]->getNormalisableRange();
+                    contributions[target] += output * connection.depth->load() * 0.01f * (range.end - range.start);
                 }
+            }
+            for (int target = 0; target < modTargetCount; ++target)
+            {
+                const auto range = modDestinations[m][target]->getNormalisableRange();
+                values[target] = range.snapToLegalValue(juce::jlimit(range.start, range.end, values[target] + contributions[target]));
             }
             GranularEngine::PitchChoices pitches;
             for (int target = 0; target < modTargetCount; ++target) liveValues[m][target].store(values[target]);
@@ -212,6 +264,8 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
                     buffer.addSample(ch, offset + i, moduleAudio[m].getSample(ch, i) * soloGain);
             }
         }
+        processEffectLane(maxBands, buffer.getWritePointer(0, offset),
+            channels > 1 ? buffer.getWritePointer(1, offset) : nullptr, length);
         for (int ch = 0; ch < channels; ++ch)
             for (int i = 0; i < length; ++i)
                 buffer.setSample(ch, offset + i, buffer.getSample(ch, offset + i) * mainGains[i] + listenAudio.getSample(ch, i));
@@ -223,6 +277,75 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
         for (int m = 0; m < maxBands; ++m) grainVisualData[start1][m] = engines[m].visualState();
         grainVisualFifo.finishedWrite(1);
     }
+}
+void GranularProcessor::processEffectLane(int lane, float* left, float* right, int samples)
+{
+    std::array<std::array<float, chunkSize>, 2> dry;
+    std::copy_n(left, samples, dry[0].data());
+    if (right != nullptr) std::copy_n(right, samples, dry[1].data());
+    const int count = juce::jlimit(0, maxEffectsPerLane, juce::roundToInt(effectParameters[lane][0]->load()));
+    for (int slot = 0; slot < count; ++slot)
+    {
+        const auto& p = effectSlotParameters[lane][slot];
+        const EffectSlot::Settings settings {juce::roundToInt(p[0]->load()), p[1]->load() >= 0.5f,
+            p[2]->load(), p[3]->load() * 0.01f, p[4]->load() * 0.01f, p[5]->load() * 0.01f,
+            p[6]->load() * 0.01f, p[7]->load(), p[8]->load(), p[9]->load()};
+        effectSlots[lane][slot]->process(left, right, samples, settings);
+    }
+    effectMix[lane].setTargetValue(effectParameters[lane][1]->load() * 0.01f);
+    effectGain[lane].setTargetValue(juce::Decibels::decibelsToGain(effectParameters[lane][2]->load()));
+    for (int i = 0; i < samples; ++i)
+    {
+        const float mix = effectMix[lane].getNextValue(), gain = effectGain[lane].getNextValue();
+        left[i] = (dry[0][i] + mix * (left[i] - dry[0][i])) * gain;
+        if (right != nullptr) right[i] = (dry[1][i] + mix * (right[i] - dry[1][i])) * gain;
+    }
+}
+void GranularProcessor::addEffect(int lane, int type)
+{
+    if (lane < 0 || lane >= effectLaneCount || type < 0 || type > 2) return;
+    const int slot = effectCount(lane);
+    if (slot >= maxEffectsPerLane) return;
+    for (const auto* control : effectSlotControls)
+    {
+        const auto id = effectSlotID(lane, slot, control);
+        auto* parameter = parameters.getParameter(id);
+        setValue(id, parameter->convertFrom0to1(parameter->getDefaultValue()));
+    }
+    setValue(effectSlotID(lane, slot, "type"), static_cast<float>(type));
+    if (type == EffectSlot::reverb) setValue(effectSlotID(lane, slot, "mix"), 25);
+    resetEffectSlots[lane].fetch_or(1u << slot);
+    setValue(effectID(lane, "count"), static_cast<float>(slot + 1));
+}
+void GranularProcessor::removeEffect(int lane, int slot)
+{
+    if (lane < 0 || lane >= effectLaneCount || slot < 0 || slot >= effectCount(lane)) return;
+    const int count = effectCount(lane);
+    for (int i = slot; i < count - 1; ++i)
+        for (const auto* control : effectSlotControls)
+            setValue(effectSlotID(lane, i, control), value(effectSlotID(lane, i + 1, control)));
+    resetEffectSlots[lane].fetch_or(((1u << count) - 1u) & ~((1u << slot) - 1u));
+    setValue(effectID(lane, "count"), static_cast<float>(count - 1));
+}
+void GranularProcessor::moveEffect(int lane, int slot, int direction)
+{
+    if (lane < 0 || lane >= effectLaneCount || (direction != -1 && direction != 1)) return;
+    const int other = slot + direction, count = effectCount(lane);
+    if (slot < 0 || slot >= count || other < 0 || other >= count) return;
+    for (const auto* control : effectSlotControls)
+    {
+        const float saved = value(effectSlotID(lane, slot, control));
+        setValue(effectSlotID(lane, slot, control), value(effectSlotID(lane, other, control)));
+        setValue(effectSlotID(lane, other, control), saved);
+    }
+    resetEffectSlots[lane].fetch_or((1u << slot) | (1u << other));
+}
+void GranularProcessor::copyEffectLane(int destination, int source)
+{
+    for (const auto* control : effectControls) setValue(effectID(destination, control), value(effectID(source, control)));
+    for (int slot = 0; slot < maxEffectsPerLane; ++slot)
+        for (const auto* control : effectSlotControls)
+            setValue(effectSlotID(destination, slot, control), value(effectSlotID(source, slot, control)));
 }
 bool GranularProcessor::readGrainVisuals(GrainVisuals& result)
 {
@@ -279,6 +402,10 @@ void GranularProcessor::addSplit(float frequency)
     splits[index] = frequency;
     auditionSource.store(-1);
     for (int i = count; i > index + 1; --i)
+        copyEffectLane(i, i - 1);
+    copyEffectLane(index + 1, index);
+    resetEffects.store(true);
+    for (int i = count; i > index + 1; --i)
         setValue("route" + juce::String(i), value("route" + juce::String(i - 1)));
     setValue("route" + juce::String(index + 1), static_cast<float>(count));
     for (int i = 0; i < count; ++i) setValue("split" + juce::String(i), splits[i]);
@@ -292,6 +419,9 @@ void GranularProcessor::removeSplit(int index)
     auto splits = boundaries();
     for (int i = index; i < count - 2; ++i) splits[i] = splits[i + 1];
     for (int i = 0; i < count - 2; ++i) setValue("split" + juce::String(i), splits[i]);
+    for (int i = index + 1; i < count - 1; ++i)
+        copyEffectLane(i, i + 1);
+    resetEffects.store(true);
     for (int i = index + 1; i < count - 1; ++i)
         setValue("route" + juce::String(i), value("route" + juce::String(i + 1)));
     setValue("bands", static_cast<float>(count - 1));
@@ -321,15 +451,18 @@ double GranularProcessor::getTailLengthSeconds() const
     const int count = juce::jlimit(0, maxModulators, juce::roundToInt(modCount->load()));
     for (int slot = 0; slot < count; ++slot)
         for (int link = 0; link < juce::jlimit(0, maxConnections, juce::roundToInt(modControls[slot].connections->load())); ++link)
-            if (juce::roundToInt(modConnections[slot][link].target->load()) == 21
-                && juce::jmax(modConnections[slot][link].minimum->load(), modConnections[slot][link].maximum->load()) >= 50)
+            if (juce::roundToInt(modConnections[slot][link].target->load()) == 21 && modConnections[slot][link].depth->load() != 0)
                 return 3600;
     for (int slot = 0; slot < count; ++slot)
         for (int link = 0; link < juce::jlimit(0, maxConnections, juce::roundToInt(modControls[slot].connections->load())); ++link)
-            if (juce::roundToInt(modConnections[slot][link].target->load()) == 5
-                && juce::jmax(modConnections[slot][link].minimum->load(), modConnections[slot][link].maximum->load()) > 0)
+            if (juce::roundToInt(modConnections[slot][link].target->load()) == 5 && modConnections[slot][link].depth->load() != 0)
                 return 900;
     double tail = 4.5;
+    // The maximum room setting can ring for tens of seconds.
+    for (int lane = 0; lane < effectLaneCount; ++lane)
+        for (int slot = 0; slot < effectCount(lane); ++slot)
+            if (effectSlotParameters[lane][slot][0]->load() == EffectSlot::reverb
+                && effectSlotParameters[lane][slot][1]->load() >= 0.5f) tail += 60.0;
     for (int m = 0; m < maxBands; ++m)
     {
         if (playbackControls[m][5]->load() >= 0.5f) return 3600;
@@ -355,6 +488,45 @@ void GranularProcessor::setStateInformation(const void* data, int bytes)
                 const auto child = incoming.getChild(i);
                 auto existing = restored.getChildWithProperty("id", child.getProperty("id"));
                 if (existing.isValid()) existing.setProperty("value", child.getProperty("value"), nullptr);
+            }
+            const auto restoreDefaultIfMissing = [&](const juce::String& id)
+            {
+                if (!incoming.getChildWithProperty("id", id).isValid())
+                {
+                    auto* parameter = parameters.getParameter(id);
+                    restored.getChildWithProperty("id", id).setProperty("value",
+                        parameter->convertFrom0to1(parameter->getDefaultValue()), nullptr);
+                }
+            };
+            for (int lane = 0; lane < effectLaneCount; ++lane)
+            {
+                for (const auto* control : effectControls) restoreDefaultIfMissing(effectID(lane, control));
+                for (int slot = 0; slot < maxEffectsPerLane; ++slot)
+                    for (const auto* control : effectSlotControls) restoreDefaultIfMissing(effectSlotID(lane, slot, control));
+            }
+            for (int slot = 0; slot < maxModulators; ++slot)
+                for (const auto* control : {"type", "smooth", "jitter", "chaos"})
+                {
+                    const auto id = modID(slot, control);
+                    if (!incoming.getChildWithProperty("id", id).isValid())
+                    {
+                        auto* parameter = parameters.getParameter(id);
+                        restored.getChildWithProperty("id", id).setProperty("value",
+                            parameter->convertFrom0to1(parameter->getDefaultValue()), nullptr);
+                    }
+                }
+            // Missing new parameters must not inherit values from the previously loaded patch.
+            for (int slot = 0; slot < maxModulators; ++slot)
+            {
+                const auto polarity = modID(slot, "polarity");
+                if (!incoming.getChildWithProperty("id", polarity).isValid())
+                    restored.getChildWithProperty("id", polarity).setProperty("value", 0, nullptr);
+                for (int link = 0; link < maxConnections; ++link)
+                {
+                    const auto id = connectionID(slot, link, "depth");
+                    if (!incoming.getChildWithProperty("id", id).isValid())
+                        restored.getChildWithProperty("id", id).setProperty("value", 0.0f, nullptr);
+                }
             }
             // Older sessions stored a single symmetric shape. Preserve both slopes.
             for (int m = 0; m < maxBands; ++m)
@@ -385,6 +557,7 @@ void GranularProcessor::setStateInformation(const void* data, int bytes)
                 }
             }
             parameters.replaceState(restored);
+            resetEffects.store(true);
             auditionSource.store(-1);
         }
 }
@@ -465,9 +638,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout GranularProcessor::createPar
                 const auto name = prefix + "Link" + juce::String(link + 1) + " ";
                 layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{connectionID(slot, link, "module"), 1}, name + "Module", 0, maxBands - 1, 0));
                 layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{connectionID(slot, link, "target"), 1}, name + "Target", targets, 2));
-                for (const auto* endpoint : {"min", "max"})
-                    layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{connectionID(slot, link, endpoint), 1}, name + endpoint,
-                        juce::NormalisableRange<float>(0, 100, 0.01f), juce::String(endpoint) == "min" ? 0.0f : 100.0f));
             }
         }
     }
@@ -498,6 +668,54 @@ juce::AudioProcessorValueTreeState::ParameterLayout GranularProcessor::createPar
         add("reverse", "Reverse chance", 0, 100, 0, "%");
         add("spread", "Stereo spread", 0, 100, 0, "%");
         layout.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{moduleID(m, "freeze"), 1}, prefix + "Freeze", false));
+    }
+    // Source polarity and signed connection depths.
+    for (int slot = 0; slot < maxModulators; ++slot)
+    {
+        const auto prefix = "LFO" + juce::String(slot + 1) + " ";
+        layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{modID(slot, "polarity"), 1},
+            prefix + "Polarity", juce::StringArray{"Unipolar", "Bipolar", "Inverted"}, 0));
+        for (int link = 0; link < maxConnections; ++link)
+        {
+            const auto name = prefix + "Link" + juce::String(link + 1) + " ";
+            layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{connectionID(slot, link, "depth"), 1},
+                name + "Depth", juce::NormalisableRange<float>(-100, 100, 0.01f), 0.0f));
+        }
+    }
+    for (int slot = 0; slot < maxModulators; ++slot)
+    {
+        const auto prefix = "Mod" + juce::String(slot + 1) + " ";
+        layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{modID(slot, "type"), 1},
+            prefix + "Type", juce::StringArray{"LFO", "Random"}, 0));
+        for (const auto* control : {"smooth", "jitter", "chaos"})
+            layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{modID(slot, control), 1},
+                prefix + control, juce::NormalisableRange<float>(0, 100, 0.1f),
+                juce::String(control) == "chaos" ? 100.0f : 0.0f));
+    }
+    for (int lane = 0; lane < effectLaneCount; ++lane)
+    {
+        const auto prefix = lane == maxBands ? juce::String("Master FX ") : "Band " + juce::String(lane + 1) + " FX ";
+        layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{effectID(lane, "count"), 1}, prefix + "Count", 0, maxEffectsPerLane, 0));
+        const auto add = [&](const juce::String& id, const juce::String& name, float low, float high, float initial, const char* unit)
+        {
+            layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{id, 1}, name,
+                juce::NormalisableRange<float>(low, high, 0.1f), initial, juce::AudioParameterFloatAttributes().withLabel(unit)));
+        };
+        add(effectID(lane, "mix"), prefix + "Mix", 0, 100, 100, "%");
+        add(effectID(lane, "gain"), prefix + "Gain", -24, 12, 0, "dB");
+        for (int slot = 0; slot < maxEffectsPerLane; ++slot)
+        {
+            const auto name = prefix + "Insert " + juce::String(slot + 1) + " ";
+            layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{effectSlotID(lane, slot, "type"), 1}, name + "Type",
+                juce::StringArray{"Distortion", "Reverb", "3-Band EQ"}, 0));
+            layout.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{effectSlotID(lane, slot, "enabled"), 1}, name + "Enabled", true));
+            add(effectSlotID(lane, slot, "drive"), name + "Drive", 0, 36, 12, "dB");
+            add(effectSlotID(lane, slot, "mix"), name + "Mix", 0, 100, 100, "%");
+            add(effectSlotID(lane, slot, "room"), name + "Room size", 0, 100, 50, "%");
+            add(effectSlotID(lane, slot, "damping"), name + "Damping", 0, 100, 50, "%");
+            add(effectSlotID(lane, slot, "width"), name + "Width", 0, 100, 100, "%");
+            for (const auto* band : {"low", "mid", "high"}) add(effectSlotID(lane, slot, band), name + band, -18, 18, 0, "dB");
+        }
     }
     return layout;
 }

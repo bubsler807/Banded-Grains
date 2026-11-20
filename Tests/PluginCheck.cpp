@@ -108,10 +108,352 @@ void checkAutomatedBandLayout()
     check(processor.soloedModule() == -1, "Automated band removal left module solo active");
 }
 
+void checkModulationContributions()
+{
+    GranularProcessor processor;
+    processor.setValue("modCount", 2);
+    processor.setValue("pitch", 7);
+    for (int slot = 0; slot < 2; ++slot)
+    {
+        processor.setValue(GranularProcessor::modID(slot, "wave"), 4); // Square starts at zero.
+        processor.setValue(GranularProcessor::modID(slot, "polarity"), 2); // Inverted output = 1.
+        processor.setValue(GranularProcessor::modID(slot, "connections"), 1);
+        processor.setValue(GranularProcessor::connectionID(slot, 0, "target"), 18);
+    }
+    processor.setValue("mod1_link1_depth", 25); // +12 semitones.
+    processor.setValue("mod2_link1_depth", -12.5f); // -6 semitones.
+    for (double rate : {44100.0, 48000.0, 96000.0})
+    {
+        processor.prepareToPlay(rate, 257);
+        for (int length : {1, 64, 257})
+        {
+            juce::AudioBuffer<float> audio(2, length); audio.clear(); juce::MidiBuffer midi;
+            processor.processBlock(audio, midi);
+            check(std::abs(processor.liveValue(0, 18) - 13) < 0.06f, "Signed contributions did not sum in destination units");
+        }
+        processor.releaseResources();
+    }
+    processor.prepareToPlay(48000, 256);
+    auto process = [&]
+    {
+        juce::AudioBuffer<float> audio(2, 256); audio.clear(); juce::MidiBuffer midi;
+        processor.processBlock(audio, midi);
+    };
+    processor.setValue("mod1_link1_depth", 100);
+    processor.setValue("mod2_link1_depth", -100);
+    process();
+    check(std::abs(processor.liveValue(0, 18) - 7) < 0.06f, "Contributions clipped before cancellation");
+    processor.setValue("mod2_link1_depth", 0);
+    process();
+    check(processor.liveValue(0, 18) == 24, "Final modulation value not clamped");
+    processor.setValue("mod1_link1_depth", 25);
+    processor.setValue("mod1_polarity", 0); process();
+    check(std::abs(processor.liveValue(0, 18) - 7) < 0.06f, "Unipolar zero changed base value");
+    processor.setValue("mod1_polarity", 1); process();
+    check(std::abs(processor.liveValue(0, 18) + 5) < 0.06f && processor.modulationOutput(0) == -1,
+          "Bipolar output or depth incorrect");
+    check(processor.value("pitch") == 7, "Contributions changed base automation value");
+    juce::MemoryBlock state;
+    processor.getStateInformation(state);
+    processor.setValue("mod1_link1_depth", -10); processor.setValue("mod1_polarity", 2);
+    processor.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    process();
+    check(processor.value("mod1_link1_depth") == 25 && processor.value("mod1_polarity") == 1
+          && std::abs(processor.liveValue(0, 18) + 5) < 0.06f, "Contribution patch recall failed");
+    processor.releaseResources();
+}
+
+void checkRandomAndEffects(bool previews)
+{
+    RandomModulator stepped, smooth, split, independent, jittered, held;
+    for (auto* random : {&stepped, &smooth, &split, &jittered, &held}) random->prepare(48000, 1234);
+    independent.prepare(48000, 5678);
+    float previous = 0.5f;
+    bool differentStream = false, differentTiming = false, smoothingObserved = false;
+    for (int i = 0; i < 40000; ++i)
+    {
+        const float a = stepped.process(1, 20, 0, 0, 1);
+        const float b = smooth.process(1, 20, 1, 0, 1);
+        const float c = independent.process(1, 20, 0, 0, 1);
+        const float d = jittered.process(1, 20, 0, 1, 1);
+        check(a >= 0 && a <= 1 && b >= 0 && b <= 1, "Random output outside unipolar range");
+        check(held.process(1, 20, 0, 0, 0) == 0.5f, "Zero chaos did not hold target");
+        if (i > 0) check(std::abs(b - previous) < 0.003f, "Random smoothing has a discontinuity");
+        previous = b;
+        differentStream |= a != c;
+        differentTiming |= a != d;
+        smoothingObserved |= std::abs(a - b) > 0.01f;
+    }
+    const float oneBlock = split.process(40000, 20, 0, 0, 1);
+    check(oneBlock == stepped.process(0, 20, 0, 0, 1), "Random depends on host block size");
+    check(differentStream && differentTiming && smoothingObserved, "Random controls have no effect");
+
+    for (double rate : {44100.0, 48000.0, 96000.0})
+        for (int channels : {1, 2})
+        {
+            EffectSlot effect;
+            EffectSlot::Settings settings;
+            effect.prepare(rate);
+            std::array<float, 256> left, right;
+            left.fill(0.1f); right.fill(-0.2f);
+            settings.enabled = false;
+            effect.process(left.data(), channels == 2 ? right.data() : nullptr, 256, settings);
+            check(left[0] == 0.1f && (channels == 1 || right[0] == -0.2f), "Disabled effect changed dry audio");
+            settings.enabled = true; effect.prepare(rate);
+            left.fill(0.1f); right.fill(-0.2f);
+            effect.process(left.data(), channels == 2 ? right.data() : nullptr, 256, settings);
+            check(left[0] > 0.2f && std::isfinite(left[0]), "Distortion did not process audio");
+            settings.mix = 0; effect.prepare(rate);
+            left.fill(0.1f); right.fill(-0.2f);
+            effect.process(left.data(), channels == 2 ? right.data() : nullptr, 256, settings);
+            check(left[0] == 0.1f, "Effect zero mix changed dry audio");
+            settings.mix = 1; settings.type = EffectSlot::reverb;
+            effect.prepare(rate);
+            double tailEnergy = 0;
+            for (int block = 0; block < 200; ++block)
+            {
+                left.fill(0); right.fill(0);
+                if (block == 0) left[0] = 1;
+                effect.process(left.data(), channels == 2 ? right.data() : nullptr, 256, settings);
+                for (int i = 0; i < 256; ++i)
+                {
+                    check(std::isfinite(left[i]) && std::abs(left[i]) < 2, "Invalid reverb output");
+                    if (channels == 2) check(std::isfinite(right[i]), "Invalid stereo reverb output");
+                    if (block > 5) tailEnergy += left[i] * left[i];
+                }
+            }
+            check(tailEnergy > 0.00001, "Reverb tail is silent");
+            settings.type = EffectSlot::equalizer;
+            const auto eqEnergy = [&](float hz, float low, float mid, float high)
+            {
+                settings.lowDb = low; settings.midDb = mid; settings.highDb = high;
+                effect.prepare(rate);
+                double energy = 0;
+                for (int block = 0; block < 80; ++block)
+                {
+                    for (int i = 0; i < 256; ++i)
+                        left[i] = right[i] = 0.1f * std::sin(juce::MathConstants<float>::twoPi * hz * (block * 256 + i) / rate);
+                    effect.process(left.data(), channels == 2 ? right.data() : nullptr, 256, settings);
+                    for (int i = 0; i < 256; ++i)
+                    {
+                        check(std::isfinite(left[i]) && std::abs(left[i]) < 3, "EQ output is invalid");
+                        if (channels == 2) check(std::abs(left[i] - right[i]) < 0.00001, "EQ stereo channels differ");
+                        if (block > 5) energy += left[i] * left[i];
+                    }
+                }
+                return energy;
+            };
+            const double lowDry = eqEnergy(50, 0, 0, 0), midDry = eqEnergy(1000, 0, 0, 0), highDry = eqEnergy(12000, 0, 0, 0);
+            check(eqEnergy(50, 12, 0, 0) > lowDry * 10, "EQ low shelf did not boost bass");
+            check(eqEnergy(1000, 0, -12, 0) < midDry * 0.1, "EQ mid cut did not affect centre frequency");
+            check(eqEnergy(12000, 0, 0, 12) > highDry * 10, "EQ high shelf did not boost treble");
+        }
+
+    {
+        GranularProcessor chain;
+        const int master = GranularProcessor::maxBands;
+        chain.setValue("mix", 0);
+        chain.addEffect(master, EffectSlot::distortion); chain.addEffect(master, EffectSlot::distortion);
+        chain.setValue("masterFx_slot2_drive", 6);
+        chain.prepareToPlay(48000, 256);
+        juce::AudioBuffer<float> audio(2, 256); juce::MidiBuffer midi;
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) audio.setSample(ch, i, 0.1f);
+        chain.processBlock(audio, midi);
+        const auto distort = [](float input, float db)
+        {
+            const float g = juce::Decibels::decibelsToGain(db);
+            return std::tanh(input * g) / std::tanh(g);
+        };
+        check(std::abs(audio.getSample(0, 255) - distort(distort(0.1f, 12), 6)) < 0.0001f,
+              "Repeated effects were not processed serially");
+        chain.moveEffect(master, 1, -1);
+        chain.prepareToPlay(48000, 256);
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) audio.setSample(ch, i, 0.1f);
+        chain.processBlock(audio, midi);
+        check(std::abs(audio.getSample(0, 255) - distort(distort(0.1f, 6), 12)) < 0.0001f,
+              "Moving an effect did not change DSP order");
+        chain.setValue("masterFx_slot2_enabled", 0);
+        chain.prepareToPlay(48000, 256);
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) audio.setSample(ch, i, 0.1f);
+        chain.processBlock(audio, midi);
+        check(std::abs(audio.getSample(0, 255) - distort(0.1f, 6)) < 0.0001f, "Insert bypass changed other effects");
+        chain.setValue("masterFx_mix", 0);
+        chain.prepareToPlay(48000, 256);
+        for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 256; ++i) audio.setSample(ch, i, 0.1f);
+        chain.processBlock(audio, midi);
+        check(std::abs(audio.getSample(0, 255) - 0.1f) < 0.0001f, "Lane zero mix did not bypass the chain");
+        chain.releaseResources();
+        for (int i = 0; i < GranularProcessor::maxEffectsPerLane + 1; ++i) chain.addEffect(11, EffectSlot::equalizer);
+        check(chain.effectCount(11) == GranularProcessor::maxEffectsPerLane, "Effect lane capacity not bounded");
+    }
+    GranularProcessor processor;
+    processor.setValue("bands", 2); processor.setValue("split0", 1000);
+    processor.setValue("mix", 0); processor.setValue("m2_mix", 0);
+    processor.addEffect(GranularProcessor::maxBands, EffectSlot::distortion);
+    const auto energy = [&](float hz, bool bandAttenuation, bool masterDistortion)
+    {
+        processor.setValue("bandFx1_gain", bandAttenuation ? -24.0f : 0.0f);
+        processor.setValue("masterFx_slot1_enabled", masterDistortion ? 1.0f : 0.0f);
+        processor.prepareToPlay(48000, 256);
+        double sum = 0;
+        for (int block = 0; block < 80; ++block)
+        {
+            juce::AudioBuffer<float> audio(2, 256); juce::MidiBuffer midi;
+            for (int i = 0; i < 256; ++i)
+                for (int ch = 0; ch < 2; ++ch)
+                    audio.setSample(ch, i, 0.1f * std::sin(juce::MathConstants<float>::twoPi * hz * (block * 256 + i) / 48000));
+            processor.processBlock(audio, midi);
+            if (block > 10) for (int i = 0; i < 256; ++i) sum += audio.getSample(0, i) * audio.getSample(0, i);
+        }
+        processor.releaseResources();
+        return sum;
+    };
+    const double lowDry = energy(80, false, false), highDry = energy(8000, false, false);
+    check(energy(80, true, false) < lowDry * 0.01, "Band lane failed to isolate low band");
+    check(energy(8000, true, false) > highDry * 0.95, "Low-band effect changed high band");
+    check(energy(80, false, true) > lowDry * 5, "Master effects did not process combined output");
+    processor.setValue("modCount", 1); processor.setValue("mod1_type", 1);
+    processor.setValue("mod1_smooth", 60); processor.setValue("mod1_jitter", 25); processor.setValue("mod1_chaos", 70);
+    processor.addEffect(1, EffectSlot::reverb);
+    processor.addEffect(1, EffectSlot::equalizer);
+    processor.setValue("bandFx2_slot2_mid", -6);
+    processor.setValue("masterFx_slot1_room", 80);
+    juce::MemoryBlock state; processor.getStateInformation(state);
+    processor.setValue("mod1_type", 0); processor.setValue("bandFx2_slot1_enabled", 0); processor.setValue("masterFx_slot1_room", 20);
+    processor.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    check(processor.value("mod1_type") == 1 && processor.value("mod1_smooth") == 60
+          && processor.value("mod1_jitter") == 25 && processor.value("mod1_chaos") == 70
+          && processor.value("bandFx2_slot1_enabled") == 1 && processor.value("bandFx2_slot2_type") == EffectSlot::equalizer
+          && processor.value("bandFx2_slot2_mid") == -6
+          && processor.value("masterFx_slot1_room") == 80, "Random/effects patch recall failed");
+    processor.addEffect(0, EffectSlot::distortion);
+    processor.setValue("bandFx1_slot1_drive", 3); processor.setValue("bandFx2_slot1_drive", 19);
+    processor.addSplit(200);
+    check(processor.value("bandFx1_slot1_drive") == 3 && processor.value("bandFx2_slot1_drive") == 3
+          && processor.value("bandFx3_slot1_drive") == 19, "Band insertion did not preserve effect lanes");
+    processor.removeSplit(0);
+    check(processor.value("bandFx2_slot1_drive") == 19, "Band removal did not preserve effect lanes");
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditor());
+    auto* fxPage = dynamic_cast<juce::TextButton*>(findComponent(*editor, "effectsPage"));
+    fxPage->onClick();
+    auto* lane = dynamic_cast<juce::ComboBox*>(findComponent(*editor, "fxLane"));
+    auto* viewport = dynamic_cast<juce::Viewport*>(findComponent(*editor, "effectViewport"));
+    check(lane && viewport, "Effects lane or scroll viewport missing");
+    lane->setSelectedId(1, juce::sendNotificationSync);
+    auto* drive = dynamic_cast<juce::Slider*>(findComponent(*editor, "effect0_drive"));
+    check(drive && drive->isVisible(), "Distortion card missing");
+    drive->setValue(21, juce::sendNotificationSync);
+    check(processor.value("bandFx1_slot1_drive") == 21, "Band effect control not attached");
+    processor.addEffect(0, EffectSlot::reverb); processor.addEffect(0, EffectSlot::equalizer);
+    pumpMessages(100);
+    auto* mid = dynamic_cast<juce::Slider*>(findComponent(*editor, "effect2_mid"));
+    check(mid, "Added EQ card missing"); mid->setValue(-9, juce::sendNotificationSync);
+    check(processor.value("bandFx1_slot3_mid") == -9, "EQ control not attached");
+    check(viewport->getViewedComponent()->getHeight() > viewport->getHeight(), "Effect list did not grow for scrolling");
+    viewport->setViewPosition(0, 200);
+    check(viewport->getViewPositionY() > 0, "Effect lane did not scroll");
+    auto* up = dynamic_cast<juce::TextButton*>(findComponent(*editor, "effectUp2"));
+    up->onClick(); pumpMessages(100);
+    check(processor.value("bandFx1_slot2_type") == EffectSlot::equalizer && processor.value("bandFx1_slot2_mid") == -9,
+          "Reordering effect lost its settings");
+    auto* remove = dynamic_cast<juce::TextButton*>(findComponent(*editor, "effectRemove0"));
+    remove->onClick(); pumpMessages(100);
+    check(processor.effectCount(0) == 2 && processor.value("bandFx1_slot1_type") == EffectSlot::equalizer,
+          "Removing an effect did not compact the lane");
+    while (processor.effectCount(0) > 0) processor.removeEffect(0, 0);
+    pumpMessages(100);
+    auto* emptyLane = findComponent(*editor, "effectChain");
+    const auto now = juce::Time::getCurrentTime();
+    const juce::MouseEvent laneClick(juce::Desktop::getInstance().getMainMouseSource(), {20, 100},
+        juce::ModifierKeys(), 1, 0, 0, 0, 0, emptyLane, emptyLane, now, {20, 100}, now, 1, false);
+    emptyLane->mouseUp(laneClick);
+    auto* emptyMenu = juce::Component::getCurrentlyModalComponent();
+    check(emptyMenu, "Clicking empty lane space did not open the effect picker");
+    emptyMenu->keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+    pumpMessages(100);
+    check(processor.effectCount(0) == 1 && processor.value("bandFx1_slot1_type") == EffectSlot::distortion,
+          "Choosing an effect in an empty lane failed");
+    lane->setSelectedId(GranularProcessor::maxBands + 1, juce::sendNotificationSync);
+    drive = dynamic_cast<juce::Slider*>(findComponent(*editor, "effect0_drive"));
+    check(drive, "Master distortion card missing"); drive->setValue(7, juce::sendNotificationSync);
+    check(processor.value("masterFx_slot1_drive") == 7, "Master insert UI not attached");
+    processor.addEffect(GranularProcessor::maxBands, EffectSlot::reverb);
+    auto* addEffect = dynamic_cast<juce::TextButton*>(findComponent(*editor, "addEffect"));
+    check(addEffect, "Add effect button missing");
+    addEffect->onClick();
+    auto* menu = juce::Component::getCurrentlyModalComponent();
+    check(menu, "Clicking the lane did not open an effect picker");
+    menu->keyPressed(juce::KeyPress(juce::KeyPress::downKey));
+    menu->keyPressed(juce::KeyPress(juce::KeyPress::downKey));
+    menu->keyPressed(juce::KeyPress(juce::KeyPress::returnKey));
+    pumpMessages(100);
+    check(processor.effectCount(GranularProcessor::maxBands) == 3
+          && processor.value("masterFx_slot3_type") == EffectSlot::equalizer,
+          "Choosing EQ from the picker did not append an EQ card");
+    processor.getStateInformation(state);
+    processor.removeEffect(GranularProcessor::maxBands, 0);
+    processor.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    pumpMessages(100);
+    check(processor.effectCount(GranularProcessor::maxBands) == 3 && processor.value("masterFx_slot1_drive") == 7,
+          "Ordered effect chain recall failed");
+    auto* type = dynamic_cast<juce::ComboBox*>(findComponent(*editor, "modType"));
+    auto* jitter = dynamic_cast<juce::Slider*>(findComponent(*editor, "randomJitter"));
+    check(type && jitter && type->getSelectedId() == 2 && jitter->isVisible(), "Random type UI missing after recall");
+    jitter->setValue(40, juce::sendNotificationSync);
+    check(processor.value("mod1_jitter") == 40, "Random controls not attached");
+    type->setSelectedId(1, juce::sendNotificationSync);
+    check(!jitter->isVisible(), "LFO displayed random controls");
+    type->setSelectedId(2, juce::sendNotificationSync);
+    if (previews)
+    {
+        const auto savePreview = [&](const char* name)
+        {
+            juce::FileOutputStream stream(juce::File::getCurrentWorkingDirectory().getChildFile("build").getChildFile(name));
+            stream.setPosition(0); stream.truncate();
+            juce::PNGImageFormat png;
+            png.writeImageToStream(editor->createComponentSnapshot(editor->getLocalBounds()), stream);
+        };
+        savePreview("effects-preview.png");
+        auto* grains = dynamic_cast<juce::TextButton*>(findComponent(*editor, "grainsPage"));
+        grains->onClick();
+        savePreview("random-preview.png");
+    }
+    // Exercise Random through the actual processor, including sync pause and connection polarity.
+    struct RandomPlayHead final : juce::AudioPlayHead
+    {
+        juce::AudioPlayHead::PositionInfo position;
+        juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override { return position; }
+    } playHead;
+    playHead.position.setBpm(120); playHead.position.setIsPlaying(false);
+    processor.setPlayHead(&playHead);
+    processor.setValue("mod1_sync", 3); processor.setValue("mod1_polarity", 1);
+    processor.setValue("mod1_connections", 1); processor.setValue("mod1_link1_target", 18);
+    processor.setValue("mod1_link1_depth", 25); processor.setValue("pitch", 0);
+    processor.prepareToPlay(48000, 256);
+    const auto process = [&]
+    {
+        juce::AudioBuffer<float> audio(2, 256); audio.clear(); juce::MidiBuffer midi;
+        processor.processBlock(audio, midi);
+    };
+    process();
+    const float stopped = processor.modulationOutput(0);
+    for (int i = 0; i < 10; ++i) process();
+    check(processor.modulationOutput(0) == stopped, "Synced Random advanced while stopped");
+    playHead.position.setIsPlaying(true);
+    for (int i = 0; i < 20; ++i) process();
+    const float randomOutput = processor.modulationOutput(0);
+    check(randomOutput != stopped && std::abs(processor.liveValue(0, 18) - 12 * randomOutput) < 0.06f,
+          "Random did not drive signed modulation contributions");
+    processor.setPlayHead(nullptr); processor.releaseResources();
+    std::cout << "Random, ordered effect lanes, picker, scrolling, EQ response, bypass and state recall passed\n";
+}
+
 int runChecks(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI initialise;
     if (argc < 2) return 1;
+    checkRandomAndEffects(argc > 2);
+    checkModulationContributions();
     checkAutomatedBandLayout();
     checkCrossovers();
     juce::VST3PluginFormat format;
@@ -419,8 +761,18 @@ int runChecks(int argc, char** argv)
     patch(2, 0);  // Switch module while dragging; same source drives Module 1 mix.
     check(direct->value("mod1_connections") == 2 && direct->value("mod1_link1_module") == 11
           && direct->value("mod1_link2_module") == 0, "Cross-module patch cable routing failed");
-    direct->setValue("mod1_link1_min", 20); direct->setValue("mod1_link1_max", 70);
-    direct->setValue("mod1_link2_min", 10); direct->setValue("mod1_link2_max", 30);
+    check(direct->value("mod1_link1_depth") == 0,
+          "New connection did not default to a zero-depth contribution");
+    auto* polarity = dynamic_cast<juce::ComboBox*>(findComponent(*editor, "modPolarity"));
+    auto* depth = dynamic_cast<juce::Slider*>(findComponent(*editor, "connectionDepth0"));
+    check(polarity && depth && depth->isVisible(), "Contribution controls missing");
+    polarity->setSelectedId(2, juce::sendNotificationSync);
+    depth->setValue(-25, juce::sendNotificationSync);
+    check(direct->value("mod1_polarity") == 1 && direct->value("mod1_link1_depth") == -25,
+          "Polarity or signed depth control not attached");
+    polarity->setSelectedId(1, juce::sendNotificationSync);
+    direct->setValue("mod1_link1_depth", 20);
+    direct->setValue("mod1_link2_depth", -10);
     const float baseFeedback = direct->value("m12_feedback"), baseMix = direct->value("mix");
     direct->setPlayConfigDetails(2, 2, 48000, 256); direct->prepareToPlay(48000, 256);
     for (int wave = 0; wave < 6; ++wave)
@@ -431,9 +783,9 @@ int runChecks(int argc, char** argv)
             juce::AudioBuffer<float> audio(2, 256); audio.clear(); juce::MidiBuffer midi;
             direct->processBlock(audio, midi);
             const float value = direct->modulationOutput(0);
-            check(std::abs(direct->liveValue(11, 5) - (19 + 47.5f * value)) < 0.06f,
+            check(std::abs(direct->liveValue(11, 5) - (baseFeedback + 19 * value)) < 0.06f,
                   "Feedback connection range incorrect");
-            check(std::abs(direct->liveValue(0, 2) - (10 + 20 * value)) < 0.06f,
+            check(std::abs(direct->liveValue(0, 2) - (baseMix - 10 * value)) < 0.06f,
                   "Same source did not drive a separate module range");
         }
     }
@@ -442,10 +794,10 @@ int runChecks(int argc, char** argv)
     direct->releaseResources();
     plugin->getStateInformation(state);
     direct->setValue("modCount", 0); direct->setValue("m12_feedback", 0);
-    direct->setValue("mod1_link1_max", 10);
+    direct->setValue("mod1_link1_depth", 10);
     plugin->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     check(direct->value("modCount") == 1 && direct->value("mod1_connections") == 2
-          && direct->value("mod1_link1_max") == 70 && direct->value("m12_feedback") == baseFeedback,
+          && direct->value("mod1_link1_depth") == 20 && direct->value("m12_feedback") == baseFeedback,
           "Feedback or shared modulation patch recall failed");
     check(direct->getTailLengthSeconds() > 2, "Feedback tail not reported to host");
     auto oldPreset = juce::ValueTree::fromXml(*juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize())));

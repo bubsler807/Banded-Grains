@@ -2,6 +2,8 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "GranularEngine.h"
 #include "BandSplitter.h"
+#include "RandomModulator.h"
+#include "EffectsLane.h"
 
 class GranularProcessor final : public juce::AudioProcessor
 {
@@ -12,6 +14,18 @@ public:
         "size", "density", "mix", "shape", "release", "feedback", "repeat", "damping",
         "pitch0", "pitch1", "pitch2", "pitch3", "chance0", "chance1", "chance2", "chance3",
         "position", "spray", "pitch", "reverse", "spread", "freeze"};
+    static constexpr int effectLaneCount = maxBands + 1, maxEffectsPerLane = 8;
+    inline static constexpr std::array<const char*, 3> effectControls {"count", "mix", "gain"};
+    inline static constexpr std::array<const char*, 10> effectSlotControls {
+        "type", "enabled", "drive", "mix", "room", "damping", "width", "low", "mid", "high"};
+    static juce::String effectID(int lane, const juce::String& control)
+    { return (lane == maxBands ? juce::String("masterFx_") : "bandFx" + juce::String(lane + 1) + "_") + control; }
+    static juce::String effectSlotID(int lane, int slot, const juce::String& control)
+    { return effectID(lane, "slot" + juce::String(slot + 1) + "_" + control); }
+    int effectCount(int lane) const { return juce::jlimit(0, maxEffectsPerLane, juce::roundToInt(value(effectID(lane, "count")))); }
+    void addEffect(int lane, int type);
+    void removeEffect(int lane, int slot);
+    void moveEffect(int lane, int slot, int direction);
     using GrainVisuals = std::array<GranularEngine::VisualState, maxBands>;
     bool readGrainVisuals(GrainVisuals&);
     static juce::String connectionID(int slot, int connection, const juce::String& control)
@@ -62,12 +76,14 @@ private:
     std::array<ModuleParameters, maxBands> controls;
     std::array<std::array<std::atomic<float>*, 3>, maxBands> feedbackControls;
     std::array<std::array<std::atomic<float>*, 6>, maxBands> playbackControls;
-    struct ModParameters { std::atomic<float>* wave; std::atomic<float>* rate; std::atomic<float>* sync; std::atomic<float>* connections; };
-    struct ModConnection { std::atomic<float>* module; std::atomic<float>* target; std::atomic<float>* minimum; std::atomic<float>* maximum; };
+    struct ModParameters { std::atomic<float>* wave; std::atomic<float>* rate; std::atomic<float>* sync; std::atomic<float>* connections; std::atomic<float>* polarity; std::atomic<float>* type;
+        std::atomic<float>* smooth; std::atomic<float>* jitter; std::atomic<float>* chaos; };
+    struct ModConnection { std::atomic<float>* module; std::atomic<float>* target; std::atomic<float>* depth; };
     std::array<std::array<ModConnection, maxConnections>, maxModulators> modConnections;
     struct ModState { double phase = 0; float held = 0.5f; uint32_t random = 1234567; };
     std::array<ModParameters, maxModulators> modControls;
     std::array<ModState, maxModulators> modStates;
+    std::array<RandomModulator, maxModulators> randomModulators;
     std::atomic<float>* modCount = nullptr;
     std::array<std::array<juce::RangedAudioParameter*, modTargetCount>, maxBands> modDestinations;
     std::array<std::array<std::atomic<float>, modTargetCount>, maxBands> liveValues {};
@@ -76,6 +92,15 @@ private:
     std::array<std::atomic<float>*, maxSplits> splitControls;
     std::array<std::atomic<float>*, maxBands> routeControls;
     std::atomic<float>* countControl = nullptr;
+    void processEffectLane(int lane, float* left, float* right, int samples);
+    void copyEffectLane(int destination, int source);
+    std::array<std::array<std::atomic<float>*, 3>, effectLaneCount> effectParameters;
+    std::array<std::array<std::array<std::atomic<float>*, 10>, maxEffectsPerLane>, effectLaneCount> effectSlotParameters;
+    std::array<std::array<std::unique_ptr<EffectSlot>, maxEffectsPerLane>, effectLaneCount> effectSlots;
+    std::array<std::atomic<unsigned>, effectLaneCount> resetEffectSlots {};
+    std::array<juce::SmoothedValue<float>, effectLaneCount> effectMix, effectGain;
+    std::array<juce::AudioBuffer<float>, maxBands> bandAudio;
+    std::atomic<bool> resetEffects {false};
     std::array<GranularEngine, maxBands> engines;
     std::array<juce::AudioBuffer<float>, maxBands> moduleAudio;
     juce::AudioBuffer<float> listenAudio;

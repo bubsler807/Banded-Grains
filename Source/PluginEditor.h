@@ -15,11 +15,17 @@ private:
     class Envelope;
     class Socket;
     class GrainView;
+    class EffectCard;
+    class EffectChain;
     void showPlayback(bool);
+    void showEffects(bool);
+    void refreshEffects();
+    void showEffectMenu();
+    void updateModulatorType();
     void refreshModulation();
     void connectModulator(int source, int target);
     void removeConnection(int connection);
-    void updateRangeText(int connection);
+    void updateDepthText(int connection);
     void timerCallback() override;
     void selectModule(int);
     GranularProcessor& processor;
@@ -28,7 +34,15 @@ private:
     std::unique_ptr<Envelope> envelope;
     std::unique_ptr<GrainView> grainView;
     juce::TextButton grainsPage {"Grains"}, playbackPage {"Playback"}, freezeButton {"Freeze buffer"};
-    bool playbackVisible = false;
+    bool playbackVisible = false, effectsVisible = false;
+    juce::TextButton effectsPage {"Effects"};
+    juce::ComboBox effectLaneSelector;
+    juce::Viewport effectViewport;
+    std::unique_ptr<EffectChain> effectChain;
+    juce::Slider effectLaneMix, effectLaneGain;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> effectMixAttachment, effectGainAttachment;
+    int selectedEffectLane = GranularProcessor::maxBands;
+
     std::array<juce::Slider, 5> playbackSliders;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 5> playbackAttachments;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> freezeAttachment;
@@ -47,22 +61,25 @@ private:
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> attachments;
     std::array<juce::Slider, 4> pitchSteps, pitchChances;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> stepAttachments, chanceAttachments;
-    juce::ComboBox sourceSelector, modWave, modSync;
+    juce::ComboBox sourceSelector, modWave, modSync, modPolarity, modType;
     juce::Slider modRate;
+    std::array<juce::Slider, 3> randomSliders;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> randomAttachments;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> typeAttachment;
     juce::TextButton addModulator {"Add modulator"}, removeModulator {"Remove"};
     juce::Viewport connectionViewport;
     juce::Component connectionStrip;
     struct ConnectionRow
     {
         juce::ComboBox module, target;
-        juce::Slider minimum, maximum;
+        juce::Slider depth;
         juce::TextButton remove {"Remove"};
         std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAttachment;
         std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> moduleAttachment;
-        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> minAttachment, maxAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> depthAttachment;
     };
     std::array<ConnectionRow, GranularProcessor::maxConnections> connectionRows;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> waveAttachment, syncAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> waveAttachment, syncAttachment, polarityAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateAttachment;
     std::array<std::unique_ptr<Socket>, GranularProcessor::modTargetCount> inputSockets;
     std::array<std::unique_ptr<Socket>, GranularProcessor::maxModulators> outputSockets;

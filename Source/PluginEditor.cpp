@@ -321,8 +321,28 @@ public:
         g.drawEllipse(getLocalBounds().toFloat().reduced(3), 1.5f);
         if (isOutput)
         {
-            g.setColour(bandColours[owner.selectedModule].withAlpha(0.3f + 0.7f * owner.processor.modulationOutput(number)));
+            g.setColour(bandColours[owner.selectedModule].withAlpha(0.3f + 0.7f * std::abs(owner.processor.modulationOutput(number))));
             g.fillEllipse(getLocalBounds().toFloat().reduced(6));
+        }
+        else
+        {
+            bool connected = false;
+            for (int source = 0; source < owner.shownModCount; ++source)
+            {
+                const int links = juce::roundToInt(owner.processor.value(GranularProcessor::modID(source, "connections")));
+                for (int link = 0; link < links; ++link)
+                    connected |= juce::roundToInt(owner.processor.value(GranularProcessor::connectionID(source, link, "module"))) == owner.selectedModule
+                        && juce::roundToInt(owner.processor.value(GranularProcessor::connectionID(source, link, "target"))) == number;
+            }
+            if (connected)
+            {
+                auto* parameter = owner.processor.parameters.getParameter(GranularProcessor::moduleID(owner.selectedModule, GranularProcessor::modTargets[number]));
+                const float value = parameter->convertTo0to1(owner.processor.liveValue(owner.selectedModule, number));
+                const float angle = juce::MathConstants<float>::pi * (0.75f + 1.5f * value);
+                const auto centre = getLocalBounds().toFloat().getCentre();
+                g.setColour(bandColours[owner.selectedModule]);
+                g.drawLine(centre.x, centre.y, centre.x + std::cos(angle) * 4, centre.y + std::sin(angle) * 4, 2);
+            }
         }
     }
     void mouseEnter(const juce::MouseEvent&) override { if (isOutput) owner.hoveredSource = number; else owner.hoveredTarget = number; owner.repaint(); }
@@ -378,6 +398,123 @@ private:
     bool isOutput;
 };
 
+class GranularEditor::EffectCard final : public juce::Component
+{
+public:
+    EffectCard(GranularEditor& editor, int lane, int index, int type) : owner(editor), lane(lane), slot(index), type(type)
+    {
+        setComponentID("effectCard" + juce::String(slot));
+        enabled.setButtonText("On"); enabled.setClickingTogglesState(true);
+        up.setButtonText("Up"); down.setButtonText("Down"); remove.setButtonText("Remove");
+        enabled.setComponentID("effectEnabled" + juce::String(slot));
+        up.setComponentID("effectUp" + juce::String(slot)); down.setComponentID("effectDown" + juce::String(slot));
+        remove.setComponentID("effectRemove" + juce::String(slot));
+        for (auto* button : {&enabled, &up, &down, &remove}) addAndMakeVisible(*button);
+        up.setEnabled(slot > 0); down.setEnabled(slot + 1 < owner.processor.effectCount(lane));
+        up.onClick = [this] { owner.processor.moveEffect(this->lane, this->slot, -1); };
+        down.onClick = [this] { owner.processor.moveEffect(this->lane, this->slot, 1); };
+        remove.onClick = [this] { owner.processor.removeEffect(this->lane, this->slot); };
+        enabledAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(owner.processor.parameters,
+            GranularProcessor::effectSlotID(lane, slot, "enabled"), enabled);
+        if (type == EffectSlot::distortion) { controls = {"drive", "mix"}; labels = {"Drive", "Mix"}; }
+        else if (type == EffectSlot::reverb) { controls = {"room", "damping", "mix", "width"}; labels = {"Room size", "Damping", "Mix", "Width"}; }
+        else { controls = {"low", "mid", "high", "mix"}; labels = {"Low / 250 Hz", "Mid / 1 kHz", "High / 4 kHz", "Mix"}; }
+        for (int i = 0; i < controls.size(); ++i)
+        {
+            auto& slider = sliders[i];
+            slider.setComponentID("effect" + juce::String(slot) + "_" + controls[i]);
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 90, 24);
+            slider.setTextValueSuffix(controls[i] == "drive" || controls[i] == "low" || controls[i] == "mid" || controls[i] == "high" ? " dB" : " %");
+            addAndMakeVisible(slider);
+            slider.setColour(juce::Slider::textBoxTextColourId, ink);
+            slider.setColour(juce::Slider::textBoxBackgroundColourId, paper);
+            slider.setColour(juce::Slider::textBoxOutlineColourId, rule);
+            slider.setColour(juce::Slider::trackColourId, bandColours[lane == maxBands ? 0 : lane]);
+            attachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(owner.processor.parameters,
+                GranularProcessor::effectSlotID(lane, slot, controls[i]), slider);
+        }
+    }
+    int preferredHeight() const { return 48 + controls.size() * 40; }
+    void resized() override
+    {
+        enabled.setBounds(getWidth() - 297, 9, 55, 26);
+        up.setBounds(getWidth() - 234, 9, 55, 26); down.setBounds(getWidth() - 171, 9, 65, 26);
+        remove.setBounds(getWidth() - 98, 9, 85, 26);
+        for (int i = 0; i < controls.size(); ++i) sliders[i].setBounds(160, 46 + i * 40, getWidth() - 178, 28);
+    }
+    void paint(juce::Graphics& g) override
+    {
+        g.setColour(paper.brighter(0.06f)); g.fillRect(getLocalBounds());
+        g.setColour(rule); g.drawRect(getLocalBounds()); g.drawHorizontalLine(42, 0, static_cast<float>(getWidth()));
+        g.setColour(ink); g.setFont(serif(18));
+        g.drawText(juce::String(slot + 1) + ". " + juce::StringArray{"Distortion", "Reverb", "3-Band EQ"}[type], 14, 9, getWidth() - 330, 26, juce::Justification::centredLeft);
+        g.setFont(sans(13));
+        for (int i = 0; i < labels.size(); ++i) g.drawText(labels[i], 16, 46 + i * 40, 138, 28, juce::Justification::centredLeft);
+    }
+private:
+    GranularEditor& owner;
+    int lane, slot, type;
+    juce::StringArray controls, labels;
+    juce::TextButton enabled, up, down, remove;
+    std::array<juce::Slider, 4> sliders;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> attachments;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enabledAttachment;
+};
+
+class GranularEditor::EffectChain final : public juce::Component
+{
+public:
+    explicit EffectChain(GranularEditor& editor) : owner(editor)
+    {
+        setComponentID("effectChain");
+        add.setButtonText("+ Add effect"); add.setComponentID("addEffect");
+        add.onClick = [this] { owner.showEffectMenu(); };
+        addAndMakeVisible(add);
+    }
+    void refresh()
+    {
+        const int lane = owner.selectedEffectLane, count = owner.processor.effectCount(lane);
+        juce::String signature = juce::String(lane) + ":" + juce::String(count);
+        for (int slot = 0; slot < count; ++slot) signature += ":" + juce::String(owner.processor.value(GranularProcessor::effectSlotID(lane, slot, "type")));
+        if (signature == shownSignature) return;
+        shownSignature = signature;
+        for (auto& card : cards) card.reset();
+        for (int slot = 0; slot < count; ++slot)
+        {
+            const int type = juce::jlimit(0, 2, juce::roundToInt(owner.processor.value(GranularProcessor::effectSlotID(lane, slot, "type"))));
+            cards[slot] = std::make_unique<EffectCard>(owner, lane, slot, type);
+            addAndMakeVisible(*cards[slot]);
+        }
+        add.setEnabled(count < GranularProcessor::maxEffectsPerLane);
+        add.setButtonText(count < GranularProcessor::maxEffectsPerLane ? "+ Add effect" : "Lane full / 8 effects");
+        resized(); repaint();
+    }
+    void resized() override
+    {
+        int y = 8;
+        for (auto& card : cards) if (card)
+        {
+            card->setBounds(8, y, getWidth() - 16, card->preferredHeight());
+            y += card->getHeight() + 10;
+        }
+        add.setBounds(8, y, getWidth() - 16, 42);
+        const int height = juce::jmax(owner.effectViewport.getHeight(), y + 58);
+        if (height != getHeight()) setSize(getWidth(), height);
+    }
+    void mouseUp(const juce::MouseEvent&) override { owner.showEffectMenu(); }
+    void paint(juce::Graphics& g) override
+    {
+        g.setColour(paper.darker(0.02f)); g.fillRect(getLocalBounds());
+        g.setColour(rule); g.drawRect(getLocalBounds());
+    }
+private:
+    GranularEditor& owner;
+    juce::TextButton add;
+    juce::String shownSignature;
+    std::array<std::unique_ptr<EffectCard>, GranularProcessor::maxEffectsPerLane> cards;
+};
+
 GranularEditor::GranularEditor(GranularProcessor& p)
     : AudioProcessorEditor(p), processor(p), paperLook(std::make_unique<PaperLook>()),
       spectrum(std::make_unique<Spectrum>(p)), envelope(std::make_unique<Envelope>(p)), grainView(std::make_unique<GrainView>(p))
@@ -390,6 +527,39 @@ GranularEditor::GranularEditor(GranularProcessor& p)
     grainsPage.onClick = [this] { showPlayback(false); };
     playbackPage.onClick = [this] { showPlayback(true); };
     addAndMakeVisible(grainsPage); addAndMakeVisible(playbackPage);
+    effectsPage.setComponentID("effectsPage");
+    effectsPage.onClick = [this] { showEffects(true); };
+    addAndMakeVisible(effectsPage);
+    effectLaneSelector.setComponentID("fxLane");
+    addAndMakeVisible(effectLaneSelector);
+    effectLaneSelector.onChange = [this]
+    {
+        if (effectLaneSelector.getSelectedId() > 0)
+        {
+            selectedEffectLane = effectLaneSelector.getSelectedId() - 1;
+            refreshEffects();
+            effectViewport.setViewPosition(0, 0);
+        }
+    };
+    effectChain = std::make_unique<EffectChain>(*this);
+    effectViewport.setViewedComponent(effectChain.get(), false);
+    effectViewport.setScrollBarsShown(true, false);
+    effectViewport.setScrollBarThickness(12);
+    effectViewport.setComponentID("effectViewport");
+    addAndMakeVisible(effectViewport);
+    for (auto* slider : {&effectLaneMix, &effectLaneGain})
+    {
+        slider->setSliderStyle(juce::Slider::LinearHorizontal);
+        slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 80, 24);
+        addAndMakeVisible(*slider);
+        slider->setColour(juce::Slider::textBoxTextColourId, ink);
+        slider->setColour(juce::Slider::textBoxBackgroundColourId, paper);
+        slider->setColour(juce::Slider::textBoxOutlineColourId, rule);
+        slider->setColour(juce::Slider::trackColourId, bandColours[0]);
+    }
+    effectLaneMix.setComponentID("effectLaneMix"); effectLaneGain.setComponentID("effectLaneGain");
+    effectLaneMix.setTextValueSuffix(" %"); effectLaneGain.setTextValueSuffix(" dB");
+    refreshEffects();
     freezeButton.setClickingTogglesState(true); freezeButton.setComponentID("freeze");
     addAndMakeVisible(freezeButton);
     for (int i = 0; i < 5; ++i)
@@ -397,6 +567,10 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         auto& slider = playbackSliders[i];
         slider.setComponentID(GranularProcessor::modTargets[16 + i]);
         slider.setTitle(juce::StringArray{"Position", "Spray", "Base pitch", "Reverse chance", "Stereo spread"}[i]);
+        slider.setColour(juce::Slider::textBoxTextColourId, ink);
+        slider.setColour(juce::Slider::textBoxBackgroundColourId, paper);
+        slider.setColour(juce::Slider::textBoxOutlineColourId, rule);
+        slider.setColour(juce::Slider::trackColourId, bandColours[0]);
         slider.setSliderStyle(juce::Slider::LinearHorizontal);
         slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 85, 24);
         slider.setTextValueSuffix(juce::StringArray{" ms", " ms", " st", " %", " %"}[i]);
@@ -474,9 +648,29 @@ GranularEditor::GranularEditor(GranularProcessor& p)
             "Low-pass cutoff inside the feedback loop. Lower values darken successive repeats."}[i]);
         addAndMakeVisible(feedbackSliders[i]);
     }
-    for (auto* combo : {&sourceSelector, &modWave, &modSync}) addAndMakeVisible(*combo);
+    for (auto* combo : {&sourceSelector, &modWave, &modSync, &modPolarity, &modType}) addAndMakeVisible(*combo);
     modWave.addItemList({"Sine", "Triangle", "Ramp up", "Ramp down", "Square", "Random hold"}, 1);
     modSync.addItemList({"Hz", "1/16", "1/8", "1/4", "1/2", "4 beats", "8 beats", "16 beats"}, 1);
+    modType.addItemList({"LFO", "Random"}, 1);
+    modType.setComponentID("modType");
+    modType.onChange = [this] { updateModulatorType(); };
+    for (int i = 0; i < 3; ++i)
+    {
+        auto& slider = randomSliders[i];
+        slider.setComponentID(juce::StringArray{"randomSmooth", "randomJitter", "randomChaos"}[i]);
+        slider.setColour(juce::Slider::textBoxTextColourId, ink);
+        slider.setColour(juce::Slider::textBoxBackgroundColourId, paper);
+        slider.setColour(juce::Slider::textBoxOutlineColourId, rule);
+        slider.setColour(juce::Slider::trackColourId, bandColours[0]);
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 65, 24);
+        slider.setTextValueSuffix(" %");
+        slider.setTooltip(juce::StringArray{"Blend between random values.", "Randomise the time between values.", "Limit how far each value can move. Zero holds the current target."}[i]);
+        addAndMakeVisible(slider);
+    }
+    modPolarity.addItemList({"Unipolar", "Bipolar", "Inverted"}, 1);
+    modPolarity.setComponentID("modPolarity");
+    modPolarity.setTooltip("Unipolar: 0 to 1. Bipolar: -1 to +1. Inverted: 1 to 0. ");
     modRate.setSliderStyle(juce::Slider::LinearHorizontal);
     modRate.setTextBoxStyle(juce::Slider::TextBoxRight, false, 65, 24);
     modRate.setTextValueSuffix(" Hz");
@@ -493,8 +687,9 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         const int count = juce::roundToInt(processor.value("modCount"));
         if (count == GranularProcessor::maxModulators) return;
         selectedSource = count;
-        for (const auto* id : {"wave", "sync", "connections"}) processor.setValue(GranularProcessor::modID(count, id), 0);
+        for (const auto* id : {"wave", "sync", "connections", "polarity", "type", "smooth", "jitter"}) processor.setValue(GranularProcessor::modID(count, id), 0);
         processor.setValue(GranularProcessor::modID(count, "rate"), 0.25f);
+        processor.setValue(GranularProcessor::modID(count, "chaos"), 100);
         processor.setValue("modCount", static_cast<float>(count + 1));
         patchMessage = "Drag an output socket to any control input.";
         refreshModulation();
@@ -505,10 +700,10 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         if (count == 0) return;
         for (int slot = selectedSource; slot < count - 1; ++slot)
         {
-            for (const auto* id : {"wave", "rate", "sync", "connections"})
+            for (const auto* id : {"wave", "rate", "sync", "connections", "polarity", "type", "smooth", "jitter", "chaos"})
                 processor.setValue(GranularProcessor::modID(slot, id), processor.value(GranularProcessor::modID(slot + 1, id)));
             for (int link = 0; link < GranularProcessor::maxConnections; ++link)
-                for (const auto* id : {"module", "target", "min", "max"})
+                for (const auto* id : {"module", "target", "depth"})
                     processor.setValue(GranularProcessor::connectionID(slot, link, id), processor.value(GranularProcessor::connectionID(slot + 1, link, id)));
         }
         processor.setValue("modCount", static_cast<float>(count - 1));
@@ -524,24 +719,21 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         auto& row = connectionRows[link];
         for (int module = 0; module < maxBands; ++module) row.module.addItem("Module " + juce::String(module + 1), module + 1);
         connectionStrip.addAndMakeVisible(row.module);
-        row.module.onChange = [this, link] { updateRangeText(link); repaint(); };
+        row.module.onChange = [this, link] { updateDepthText(link); repaint(); };
         row.target.addItemList({"Grain size", "Density", "Dry / Wet", "Attack slope", "Release slope", "Feedback", "Repeat time", "Damping",
             "Pitch 1", "Pitch 2", "Pitch 3", "Pitch 4", "Chance 1", "Chance 2", "Chance 3", "Chance 4",
             "Position", "Spray", "Base pitch", "Reverse chance", "Stereo spread", "Freeze"}, 1);
         row.target.setComponentID("connectionTarget" + juce::String(link));
         connectionStrip.addAndMakeVisible(row.target);
-        for (auto* slider : {&row.minimum, &row.maximum})
-        {
-            slider->setSliderStyle(juce::Slider::LinearHorizontal);
-            slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 95, 24);
-            slider->setColour(juce::Slider::textBoxTextColourId, ink);
-            slider->setColour(juce::Slider::textBoxBackgroundColourId, paper);
-            slider->setColour(juce::Slider::textBoxOutlineColourId, rule);
-            connectionStrip.addAndMakeVisible(*slider);
-        }
-        row.minimum.setComponentID("connectionMin" + juce::String(link));
-        row.maximum.setComponentID("connectionMax" + juce::String(link));
-        row.target.onChange = [this, link] { updateRangeText(link); repaint(); };
+        row.depth.setColour(juce::Slider::textBoxTextColourId, ink);
+        row.depth.setColour(juce::Slider::textBoxBackgroundColourId, paper);
+        row.depth.setColour(juce::Slider::textBoxOutlineColourId, rule);
+        row.depth.setSliderStyle(juce::Slider::LinearHorizontal);
+        row.depth.setTextBoxStyle(juce::Slider::TextBoxRight, false, 110, 24);
+        row.depth.setComponentID("connectionDepth" + juce::String(link));
+        row.depth.setTooltip("Signed contribution in the destination's units. Added to the knob value alongside other connections.");
+        connectionStrip.addAndMakeVisible(row.depth);
+        row.target.onChange = [this, link] { updateDepthText(link); repaint(); };
         row.remove.onClick = [this, link] { removeConnection(link); };
         connectionStrip.addAndMakeVisible(row.remove);
     }
@@ -557,7 +749,7 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         addAndMakeVisible(*outputSockets[i]);
     }
     selectModule(0);
-    setSize(1100, 1000);
+    setSize(1100, 1050);
     showPlayback(false);
     timerCallback();
     startTimerHz(30);
@@ -636,6 +828,11 @@ void GranularEditor::resized()
         if (i < 3) sliders[i].setBounds(132, 480 + i * 44, 175, 38);
     }
     grainsPage.setBounds(42, 450, 105, 24); playbackPage.setBounds(150, 450, 115, 24);
+    effectsPage.setBounds(275, 450, 75, 24);
+    effectLaneSelector.setBounds(42, 489, 250, 28);
+    effectLaneMix.setBounds(405, 489, 260, 28); effectLaneGain.setBounds(790, 489, 250, 28);
+    effectViewport.setBounds(42, 550, getWidth() - 84, 282);
+    effectChain->setSize(effectViewport.getWidth() - 14, effectChain->getHeight());
     for (int i = 0; i < 5; ++i)
     {
         const int column = i / 2, row = i % 2;
@@ -646,20 +843,22 @@ void GranularEditor::resized()
     freezeButton.setBounds(770, 574, 270, 30); inputSockets[21]->setBounds(750, 580, 18, 18);
     grainView->setBounds(42, 617, getWidth() - 84, 44);
     sourceSelector.setBounds(180, 852, 125, 28);
-    addModulator.setBounds(318, 852, 140, 28);
-    removeModulator.setBounds(470, 852, 90, 28);
+    modType.setBounds(310, 852, 105, 28);
+    addModulator.setBounds(425, 852, 120, 28);
+    removeModulator.setBounds(553, 852, 90, 28);
     modWave.setBounds(42, 904, 155, 28);
     modRate.setBounds(210, 904, 180, 28);
     modSync.setBounds(405, 904, 110, 28);
-    connectionViewport.setBounds(42, 957, getWidth() - 84, 35);
+    modPolarity.setBounds(530, 904, 125, 28);
+    for (int i = 0; i < 3; ++i) randomSliders[i].setBounds(42 + i * 340, 954, 310, 28);
+    connectionViewport.setBounds(42, 1007, getWidth() - 84, 35);
     connectionStrip.setSize(getWidth() - 100, juce::jmax(1, shownConnections) * 38);
     for (int link = 0; link < GranularProcessor::maxConnections; ++link)
     {
         auto& row = connectionRows[link];
         row.module.setBounds(0, link * 38, 120, 28);
         row.target.setBounds(130, link * 38, 175, 28);
-        row.minimum.setBounds(320, link * 38, 250, 28);
-        row.maximum.setBounds(585, link * 38, 250, 28);
+        row.depth.setBounds(320, link * 38, 515, 28);
         row.remove.setBounds(850, link * 38, 105, 28);
     }
     const std::array<juce::Point<int>, 8> sockets {{{122, 499}, {122, 543}, {122, 587}, {346, 490},
@@ -684,6 +883,7 @@ void GranularEditor::timerCallback()
     const int count = processor.bandCount();
     if (count != displayedBands)
     {
+        refreshEffects();
         displayedBands = count;
         bandStrip.setSize(juce::jmax(4, count) * ((getWidth() - 64) / 4), 60);
     }
@@ -715,6 +915,7 @@ void GranularEditor::timerCallback()
     const int links = modCount > 0 ? juce::roundToInt(processor.value(GranularProcessor::modID(juce::jmin(selectedSource, modCount - 1), "connections"))) : 0;
     if (modCount != shownModCount || links != shownConnections) refreshModulation();
     modRate.setEnabled(modCount > 0 && modSync.getSelectedItemIndex() == 0);
+    if (effectsVisible) effectChain->refresh();
     envelope->repaint();
     grainView->update();
     repaint();
@@ -727,6 +928,17 @@ void GranularEditor::paint(juce::Graphics& g)
     g.setColour(rule); g.drawHorizontalLine(76, 32, static_cast<float>(getWidth() - 32));
     const int width = (getWidth() - 64) / 4;
     g.setColour(rule); g.drawRect(32, 326, getWidth() - 64, 60);
+    if (effectsVisible)
+    {
+        g.setColour(ink); g.setFont(sans(13));
+        g.drawText("Lane mix", 315, 489, 90, 28, juce::Justification::centredLeft);
+        g.drawText("Lane gain", 700, 489, 90, 28, juce::Justification::centredLeft);
+        g.setColour(muted);
+        g.drawText(selectedEffectLane == maxBands ? "Master / after the granular mix. Effects run from top to bottom." : "Band / before granular routing. Effects run from top to bottom.",
+            42, 520, 990, 24, juce::Justification::centredLeft);
+    }
+    else
+    {
     if (!playbackVisible)
     {
     for (int i = 0; i < 3; ++i)
@@ -763,6 +975,7 @@ void GranularEditor::paint(juce::Graphics& g)
         g.drawText("Chance: " + juce::String(chance, 1) + "%", x, 760, width - 20, 18, juce::Justification::centredLeft);
     }
     g.drawText("Unused chance plays the original pitch. Totals above 100% are scaled proportionally.", 42, 819, 890, 20, juce::Justification::centredLeft);
+    }
     g.setColour(rule); g.drawHorizontalLine(846, 32, getWidth() - 32.0f);
     g.setColour(ink); g.setFont(serif(18));
     g.drawText("Modulation", 42, 852, 135, 28, juce::Justification::centredLeft);
@@ -770,29 +983,36 @@ void GranularEditor::paint(juce::Graphics& g)
     g.drawText("Waveform", 42, 884, 155, 18, juce::Justification::centredLeft);
     g.drawText("Rate", 210, 884, 180, 18, juce::Justification::centredLeft);
     g.drawText("Timing", 405, 884, 110, 18, juce::Justification::centredLeft);
+    g.drawText("Polarity", 530, 884, 125, 18, juce::Justification::centredLeft);
     g.drawText(patchMessage.isEmpty() ? "Drag an output to a control input. Hover an output to see its cables." : patchMessage,
-        535, 892, getWidth() - 577, 38, juce::Justification::centredLeft);
-    g.drawText("Connections (" + juce::String(shownConnections) + ") / scroll to view", 42, 936, 300, 18, juce::Justification::centredLeft);
-    g.drawText("Minimum", 362, 936, 275, 18, juce::Justification::centredLeft);
-    g.drawText("Maximum", 627, 936, 275, 18, juce::Justification::centredLeft);
+        670, 892, getWidth() - 712, 38, juce::Justification::centredLeft);
+    g.drawText("Connections (" + juce::String(shownConnections) + ") / scroll to view", 42, 986, 300, 18, juce::Justification::centredLeft);
+    g.drawText("Signed depth", 362, 986, 380, 18, juce::Justification::centredLeft);
+    if (modType.getSelectedId() == 2 && shownModCount > 0)
+    {
+        for (int i = 0; i < 3; ++i)
+            g.drawText(juce::StringArray{"Smooth", "Jitter", "Chaos"}[i], 42 + i * 340, 936, 310, 18, juce::Justification::centredLeft);
+    }
+    else g.drawText("Choose Random for smooth or stepped movement with adjustable timing jitter.", 42, 954, 990, 28, juce::Justification::centredLeft);
     for (int slot = 0; slot < shownModCount; ++slot)
-        g.drawText("LFO " + juce::String(slot + 1), 663 + slot * 90, 855, 45, 22, juce::Justification::centredRight);
+        g.drawText("Mod " + juce::String(slot + 1), 663 + slot * 90, 855, 45, 22, juce::Justification::centredRight);
 
 }
 
 void GranularEditor::refreshModulation()
 {
-    waveAttachment.reset(); syncAttachment.reset(); rateAttachment.reset();
-    for (auto& row : connectionRows) { row.moduleAttachment.reset(); row.targetAttachment.reset(); row.minAttachment.reset(); row.maxAttachment.reset(); }
+    waveAttachment.reset(); syncAttachment.reset(); rateAttachment.reset(); polarityAttachment.reset(); typeAttachment.reset();
+    for (auto& attachment : randomAttachments) attachment.reset();
+    for (auto& row : connectionRows) { row.moduleAttachment.reset(); row.targetAttachment.reset(); row.depthAttachment.reset(); }
     shownModCount = juce::jlimit(0, GranularProcessor::maxModulators,
         juce::roundToInt(processor.value("modCount")));
     selectedSource = juce::jlimit(0, juce::jmax(0, shownModCount - 1), selectedSource);
     sourceSelector.clear(juce::dontSendNotification);
-    for (int i = 0; i < shownModCount; ++i) sourceSelector.addItem("LFO " + juce::String(i + 1), i + 1);
+    for (int i = 0; i < shownModCount; ++i) sourceSelector.addItem("Mod " + juce::String(i + 1), i + 1);
     sourceSelector.setSelectedId(shownModCount > 0 ? selectedSource + 1 : 0, juce::dontSendNotification);
     sourceSelector.setTextWhenNothingSelected("No modulators");
     const bool active = shownModCount > 0;
-    sourceSelector.setEnabled(active); modWave.setEnabled(active); modSync.setEnabled(active); modRate.setEnabled(active);
+    sourceSelector.setEnabled(active); modWave.setEnabled(active); modSync.setEnabled(active); modRate.setEnabled(active); modPolarity.setEnabled(active); modType.setEnabled(active);
     modRate.setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
     addModulator.setEnabled(shownModCount < GranularProcessor::maxModulators); removeModulator.setEnabled(active);
     for (int i = 0; i < GranularProcessor::maxModulators; ++i) outputSockets[i]->setVisible(i < shownModCount);
@@ -801,6 +1021,13 @@ void GranularEditor::refreshModulation()
         juce::roundToInt(processor.value(GranularProcessor::modID(selectedSource, "connections")))) : 0;
     if (active)
     {
+        typeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
+            GranularProcessor::modID(selectedSource, "type"), modType);
+        for (int i = 0; i < 3; ++i)
+            randomAttachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
+                GranularProcessor::modID(selectedSource, juce::StringArray{"smooth", "jitter", "chaos"}[i]), randomSliders[i]);
+        polarityAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
+            GranularProcessor::modID(selectedSource, "polarity"), modPolarity);
         waveAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
             GranularProcessor::modID(selectedSource, "wave"), modWave);
         syncAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
@@ -811,36 +1038,39 @@ void GranularEditor::refreshModulation()
     for (int link = 0; link < GranularProcessor::maxConnections; ++link)
     {
         auto& row = connectionRows[link];
-        row.minimum.setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
-        row.maximum.setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
+        row.depth.setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
         const bool visible = link < shownConnections;
-        row.module.setVisible(visible); row.target.setVisible(visible); row.minimum.setVisible(visible); row.maximum.setVisible(visible); row.remove.setVisible(visible);
+        row.module.setVisible(visible); row.target.setVisible(visible); row.depth.setVisible(visible); row.remove.setVisible(visible);
         if (!visible) continue;
         row.moduleAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
             GranularProcessor::connectionID(selectedSource, link, "module"), row.module);
         row.targetAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.parameters,
             GranularProcessor::connectionID(selectedSource, link, "target"), row.target);
-        row.minAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
-            GranularProcessor::connectionID(selectedSource, link, "min"), row.minimum);
-        row.maxAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
-            GranularProcessor::connectionID(selectedSource, link, "max"), row.maximum);
-        updateRangeText(link);
+        row.depthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
+            GranularProcessor::connectionID(selectedSource, link, "depth"), row.depth);
+        updateDepthText(link);
     }
+    updateModulatorType();
     if (getWidth() > 0) resized();
     repaint();
 }
-void GranularEditor::updateRangeText(int link)
+void GranularEditor::updateDepthText(int link)
 {
     auto& row = connectionRows[link];
     const int target = juce::jlimit(0, GranularProcessor::modTargetCount - 1, row.target.getSelectedItemIndex());
     const int module = juce::jlimit(0, maxBands - 1, row.module.getSelectedItemIndex());
     auto* parameter = processor.parameters.getParameter(GranularProcessor::moduleID(module, GranularProcessor::modTargets[target]));
-    for (auto* slider : {&row.minimum, &row.maximum})
+    const auto range = parameter->getNormalisableRange();
+    const float span = range.end - range.start;
+    const auto unit = (target >= 8 && target < 12) || target == 18 ? juce::String("st") : parameter->getLabel();
+    row.depth.textFromValueFunction = [unit, span](double value)
     {
-        slider->textFromValueFunction = [parameter](double value) { return parameter->getText(static_cast<float>(value * 0.01), 30) + " " + parameter->getLabel(); };
-        slider->valueFromTextFunction = [parameter](const juce::String& value) { return parameter->getValueForText(value) * 100.0; };
-        slider->updateText();
-    }
+        const double amount = value * 0.01 * span;
+        return (amount > 0 ? "+" : "") + juce::String(amount, 2) + " " + unit;
+    };
+    row.depth.valueFromTextFunction = [span](const juce::String& text) { return text.getDoubleValue() * 100.0 / span; };
+    row.depth.updateText();
+
 }
 void GranularEditor::connectModulator(int source, int target)
 {
@@ -854,11 +1084,10 @@ void GranularEditor::connectModulator(int source, int target)
     { patchMessage = "This output has four connections. Remove one to add another."; repaint(); return; }
     processor.setValue(GranularProcessor::connectionID(source, count, "module"), static_cast<float>(selectedModule));
     processor.setValue(GranularProcessor::connectionID(source, count, "target"), static_cast<float>(target));
-    processor.setValue(GranularProcessor::connectionID(source, count, "min"), 0);
-    processor.setValue(GranularProcessor::connectionID(source, count, "max"), 100);
+    processor.setValue(GranularProcessor::connectionID(source, count, "depth"), 0);
     processor.setValue(countID, static_cast<float>(count + 1));
     selectedSource = source;
-    patchMessage = "Set this connection's minimum and maximum below.";
+    patchMessage = "Set signed depth below. Contributions add to the knob value.";
     refreshModulation();
     connectionViewport.setViewPosition(0, count * 38);
 }
@@ -868,7 +1097,7 @@ void GranularEditor::removeConnection(int connection)
     const int count = juce::roundToInt(processor.value(countID));
     if (connection >= count) return;
     for (int link = connection; link < count - 1; ++link)
-        for (const auto* id : {"module", "target", "min", "max"})
+        for (const auto* id : {"module", "target", "depth"})
             processor.setValue(GranularProcessor::connectionID(selectedSource, link, id),
                 processor.value(GranularProcessor::connectionID(selectedSource, link + 1, id)));
     processor.setValue(countID, static_cast<float>(count - 1));
@@ -876,6 +1105,13 @@ void GranularEditor::removeConnection(int connection)
 }
 void GranularEditor::showPlayback(bool playback)
 {
+    effectsVisible = false;
+    effectsPage.setToggleState(false, juce::dontSendNotification);
+    for (auto* component : std::array<juce::Component*, 4>{&effectLaneSelector, &effectViewport, &effectLaneMix, &effectLaneGain}) component->setVisible(false);
+    for (auto& slider : pitchSteps) slider.setVisible(true);
+    for (auto& slider : pitchChances) slider.setVisible(true);
+    for (int i = 8; i < 16; ++i) inputSockets[i]->setVisible(true);
+    grainView->setVisible(true);
     playbackVisible = playback;
     grainsPage.setToggleState(!playback, juce::dontSendNotification);
     playbackPage.setToggleState(playback, juce::dontSendNotification);
@@ -888,6 +1124,64 @@ void GranularEditor::showPlayback(bool playback)
     for (int i = 16; i < GranularProcessor::modTargetCount; ++i) inputSockets[i]->setVisible(playback);
     hoveredTarget = -1;
     repaint();
+}
+void GranularEditor::updateModulatorType()
+{
+    const bool random = modType.getSelectedId() == 2 && shownModCount > 0;
+    modWave.setEnabled(!random && shownModCount > 0);
+    for (auto& slider : randomSliders) slider.setVisible(random);
+    repaint();
+}
+void GranularEditor::showEffects(bool show)
+{
+    showPlayback(false);
+    if (!show) return;
+    effectsVisible = true;
+    grainsPage.setToggleState(false, juce::dontSendNotification);
+    effectsPage.setToggleState(true, juce::dontSendNotification);
+    for (auto& slider : sliders) slider.setVisible(false);
+    for (auto& slider : feedbackSliders) slider.setVisible(false);
+    for (auto& slider : pitchSteps) slider.setVisible(false);
+    for (auto& slider : pitchChances) slider.setVisible(false);
+    for (auto& socket : inputSockets) socket->setVisible(false);
+    envelope->setVisible(false); grainView->setVisible(false);
+    for (auto* component : std::array<juce::Component*, 4>{&effectLaneSelector, &effectViewport, &effectLaneMix, &effectLaneGain}) component->setVisible(true);
+    refreshEffects();
+    repaint();
+}
+void GranularEditor::refreshEffects()
+{
+    effectLaneSelector.clear(juce::dontSendNotification);
+    for (int band = 0; band < processor.bandCount(); ++band)
+        effectLaneSelector.addItem("Band " + juce::String(band + 1), band + 1);
+    effectLaneSelector.addItem("Master", maxBands + 1);
+    if (selectedEffectLane >= processor.bandCount() && selectedEffectLane != maxBands) selectedEffectLane = maxBands;
+    effectLaneSelector.setSelectedId(selectedEffectLane + 1, juce::dontSendNotification);
+    effectMixAttachment.reset(); effectGainAttachment.reset();
+    effectMixAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
+        GranularProcessor::effectID(selectedEffectLane, "mix"), effectLaneMix);
+    effectGainAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
+        GranularProcessor::effectID(selectedEffectLane, "gain"), effectLaneGain);
+    effectChain->refresh();
+}
+void GranularEditor::showEffectMenu()
+{
+    const int lane = selectedEffectLane;
+    if (processor.effectCount(lane) >= GranularProcessor::maxEffectsPerLane) return;
+    juce::PopupMenu menu;
+    menu.addItem(1, "Distortion"); menu.addItem(2, "Reverb"); menu.addItem(3, "3-Band EQ");
+    juce::Component::SafePointer<GranularEditor> safe(this);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&effectViewport).withParentComponent(this).withInitiallySelectedItem(1),
+        [safe, lane](int choice)
+        {
+            if (safe == nullptr || choice == 0) return;
+            safe->processor.addEffect(lane, choice - 1);
+            if (safe->selectedEffectLane == lane)
+            {
+                safe->refreshEffects();
+                safe->effectViewport.setViewPosition(0, safe->effectChain->getHeight());
+            }
+        });
 }
 void GranularEditor::paintOverChildren(juce::Graphics& g)
 {
