@@ -6,6 +6,8 @@ A Windows x64 VST3 audio effect built with C++17 and JUCE 8.0.12.
 
 Insert it on an audio track and feed it sound. This is an effect, not a synthesizer.
 
+![Banded Grains interface showing frequency bands, grain controls, and modulation](docs/banded-grains.png)
+
 
 
 ## Controls
