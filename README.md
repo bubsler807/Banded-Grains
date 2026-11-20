@@ -1,155 +1,132 @@
 # Banded Grains
 
-Multiband granular audio effect for Windows x64, implemented in C++17 with JUCE 8.0.12. The build produces a VST3 plugin with matching mono or stereo input/output buses. MIDI input and output are disabled.
+Banded Grains is a multiband granular audio effect for Windows x64. It splits incoming audio into frequency bands and sends them to independent granular processors, so different parts of a sound can have their own grain timing, pitch, feedback, and modulation.
+
+The plugin runs as a VST3 effect in a DAW and supports mono and stereo audio. It is built with C++17 and JUCE 8.0.12.
 
 ![Banded Grains interface](docs/banded-grains.png)
 
-## Signal path
+## How it works
 
-```text
-Audio input -> crossover bank -> band-to-module routing -> granular modules -> summed output
-                    |
-                    +-> raw band audition
-```
+Create up to 12 frequency bands and route each one to any of 12 processing modules. Multiple bands can share a module; their signals are combined before processing. The default setup sends the full frequency range to Module 1.
 
-The crossover bank supports 1-12 bands using up to 11 fourth-order Linkwitz-Riley crossovers. All-pass compensation gives the recombined dry bands a flat magnitude response; the filters still introduce phase shift. Cutoff changes are smoothed over 30 ms. Changing the band count resets filter state and can produce a transient.
+Each module records incoming audio into a four-second buffer and plays back short overlapping fragments called grains. Grain duration, playback position, pitch, direction, and envelope determine the result. Each module also has its own feedback loop and dry/wet mix.
 
-Each band routes to one of 12 independent processing modules. Bands assigned to the same module are summed before granular processing. All modules continue processing after routing changes, allowing existing grain and feedback tails to decay. The initial configuration routes one full-range band to Module 1.
+The frequency bands use 24 dB/octave Linkwitz-Riley crossovers with phase compensation. Their transitions overlap, and the recombined dry signal has a flat frequency response. Moving crossover frequencies is smoothed; adding or removing bands can cause a brief transient.
 
-Each module contains:
+## Grain and feedback controls
 
-- A four-second circular recording buffer per channel.
-- A fixed pool of 32 grains with shared stereo timing and independently adjustable attack/release cosine fades.
-- Linear-interpolated playback with pitch transposition, reverse playback, and stereo balance randomization.
-- A feedback path taken before the output dry/wet mix, with an interpolated delay, saturation, and low-pass damping. The return is added to the recording buffer.
-- Smoothed dry/wet mixing and overlap gain compensation.
+Select a module tab to edit its settings. The **Grains** panel contains timing, envelope, and feedback controls.
 
-Pitch transposition changes the read rate within a grain while its output duration remains fixed. The wet path has capture lookback latency and an initial buffer-fill period. Overlap compensation controls average gain; the output has no peak limiter.
+| Control | Range | Function |
+| --- | --- | --- |
+| Grain size | 20-250 ms | Duration of each grain |
+| Density | 2-40 grains/s | Number of grains launched per second |
+| Dry / Wet | 0-100% | Balance between the module's input and granular output |
+| Attack / Release | 2.5-50% of grain duration each | Independent fade-in and fade-out, adjusted by dragging the envelope slopes |
+| Feedback | 0-95% | Amount of processed audio returned to the recording buffer |
+| Repeat time | 10-2000 ms | Delay within the feedback loop |
+| Damping | 100-20000 Hz | Low-pass filtering in the feedback loop |
 
-## Module parameters
+Each module has four pitch choices from -24 to +24 semitones, each with its own probability. Unassigned probability plays without an additional pitch offset. If the probabilities add up to more than 100%, they are scaled proportionally.
 
-Ranges below are the exposed plugin parameter ranges. Attack and release are shown as fractions of grain duration; their host parameters (`shape` and `release`) range from 0-100 and map inversely from 50% to 2.5%.
+Feedback is taken before the dry/wet mix, so changing the mix does not change the feedback amount. The loop includes saturation and damping to control buildup. Repeat time sets the delay within this loop; grain capture and playback add to the audible repeat interval. Changing repeat time smoothly can bend the pitch of the return.
 
-| Parameter | Range | Default | Behavior |
-| --- | --- | --- | --- |
-| Grain size | 20-250 ms | 100 ms | Output duration of each grain |
-| Density | 2-40 grains/s | 15 grains/s | Grain launch rate |
-| Dry / Wet | 0-100% | 50% | Module output mix |
-| Attack / Release | 2.5-50% each | 50% each | Independent cosine fade durations |
-| Feedback | 0-95% | 0% | Feedback return gain |
-| Repeat time | 10-2000 ms | 350 ms | Delay within the feedback loop |
-| Damping | 100-20000 Hz | 6000 Hz | Feedback low-pass cutoff, internally capped at 0.45 times sample rate |
-| Position | 0-1500 ms | 150 ms | Additional lookback behind the grain safety offset |
-| Spray | 0-1000 ms | 200 ms | Total randomized position width centered on Position |
-| Base pitch | -24 to +24 semitones | 0 | Added to the selected pitch offset |
-| Reverse chance | 0-100% | 0% | Probability of reverse playback at grain launch |
-| Stereo spread | 0-100% | 0% | Random per-grain stereo balance; inactive for mono |
-| Freeze | Off / On | Off | Stops recording and holds the recording head while grains continue |
+## Playback controls
 
-Each module also has four integer pitch offsets (-24 to +24 semitones) with independent probabilities (0-100%). The default offsets are -12, -7, +7, and +12 semitones, with all probabilities initially zero. Unassigned probability selects a zero offset. If the sum exceeds 100%, the probabilities are normalized proportionally. Base pitch is added afterward, and the combined transposition is clamped to -36 to +36 semitones.
+The **Playback** panel controls which part of the buffer is used and how each grain plays it.
 
-Capture positions are clamped to the valid recording-buffer region. Grain settings are captured at launch; changes affect subsequent grains. Feedback, repeat time, damping, dry/wet mix, and overlap gain are smoothed. Changing repeat time can bend the pitch of the feedback return. The audible loop interval also includes granular capture/playback delay.
+| Control | Range | Function |
+| --- | --- | --- |
+| Position | 0-1500 ms | Additional lookback into previously recorded audio |
+| Spray | 0-1000 ms | Width of the random position variation around Position |
+| Base pitch | -24 to +24 semitones | Transposition applied alongside the four pitch choices |
+| Reverse chance | 0-100% | Probability that a new grain plays backward |
+| Stereo spread | 0-100% | Random stereo balance for each grain; inactive in mono |
+| Freeze | Off / On | Holds the recorded buffer while grains continue playing |
 
-Freeze preserves the module's recorded audio while its dry path remains live. A frozen empty buffer produces no wet signal.
+Combined pitch is limited to -36 to +36 semitones. Pitch shifting changes playback speed within each grain while its duration stays fixed. Grain settings take effect on newly launched grains.
+
+The grain display shows the selected module's recording head and active grains. Freeze stops the recording head; the dry signal remains live. Recorded audio is not saved with a DAW session, and freeze resets to off when settings are recalled.
+
+## Routing and monitoring
+
+- **Add a band:** double-click inside the spectrum.
+- **Adjust a split:** drag its divider horizontally.
+- **Remove a split:** right-click its divider. The lower band's routing is retained.
+- **Route a band:** choose a destination in its module dropdown. Scroll the routing row to reach additional bands.
+- **Audition a band:** click its **s** button below the spectrum to hear that frequency range before granular processing.
+- **Solo a module:** click **s** in its module tab to hear its processed output, including grain and feedback tails.
+
+Band audition and module solo replace one another. Click the active button again to restore the full mix. These monitoring states are temporary and clear when the band count changes or settings are recalled.
+
+The spectrum displays the incoming audio before granular processing. Modules continue running after routing changes so existing tails can decay.
 
 ## Modulation
 
-Up to four shared LFOs are available, each with up to four connections across the 12 modules. All 22 module parameter targets are available, including pitch probabilities and freeze.
+Up to four shared LFOs can modulate controls across all modules. Each LFO supports four connections, with a separate destination and minimum/maximum range for each connection.
 
-| Setting | Values |
-| --- | --- |
-| Waveform | Sine, triangle, ramp up, ramp down, square, random hold |
-| Free-running rate | 0.02-20 Hz |
-| Tempo cycle length | 1/16 note, 1/8 note, 1/4 note, 1/2 note, 4 beats, 8 beats, 16 beats |
-| Connection data | Destination module, target parameter, minimum, maximum |
+Available waveforms are sine, triangle, ramp up, ramp down, square, and random hold. LFOs run at 0.02-20 Hz or follow tempo-based cycles from a sixteenth note to 16 beats.
 
-Modulation is evaluated once per processing chunk of at most 256 samples. Each connection maps the LFO output into the destination's normalized parameter range; the editor displays endpoints in destination units. Reversed endpoints invert the mapping. If multiple connections address the same target, the last connection in source/connection order wins. Modulation overrides the effective DSP value without writing back to the base host parameter.
+To connect an LFO, drag its output socket onto a control's input socket. Hover a module tab while dragging to switch modules. Hover a socket to display its cables, or click a connected input to select its connection. Connection ranges can be typed in the destination control's units; reversing the endpoints reverses the modulation.
 
-Free-running LFOs advance continuously. Tempo-based LFOs pause when the host reports stopped transport and use 120 BPM if tempo is unavailable. Phase resets during audio preparation; synchronization follows tempo rather than host timeline position.
+Modulation acts on the processing value without changing the underlying knob or DAW automation value. If several connections target the same control, the last connection in source/connection order takes priority.
 
-To create a connection, drag an LFO output socket onto a visible control input. Hovering a module tab during a drag changes the destination module. Hover a socket to display its cables; click a connected input to select the corresponding connection.
+Tempo-based LFOs pause when the host reports stopped transport and use 120 BPM if host tempo is unavailable. They follow the tempo without locking their phase to the DAW timeline.
 
-## Routing, monitoring, and state
+## Processing notes
 
-- Double-click the spectrum to insert a crossover, drag a divider to change its frequency, and right-click a divider to remove it. Removal retains the lower band's routing.
-- Band dropdowns select destination modules. The routing row scrolls horizontally when needed.
-- A band's **s** button auditions its crossover output before granular processing. A module's **s** button solos its processed output, including tails. These modes are mutually exclusive and use crossfades.
-- Audition and solo are temporary. They are cleared on band-count changes and state recall, and are excluded from saved state.
-- Parameters, crossovers, routing, and modulation connections are serialized through `AudioProcessorValueTreeState`. Module 1 uses unprefixed parameter IDs; Modules 2-12 use `m2_` through `m12_` prefixes.
-- Recorded audio is excluded from serialized state. Freeze is reset to off during state recall.
+- The wet signal has an initial fill period and an audible delay from reading previously recorded audio. The dry path remains immediate within each module.
+- Low density or short grains can produce gaps. Overlap compensation controls average level, but the output has no peak limiter.
+- Parameters, crossover positions, routing, and modulation connections are saved with the DAW session. Recorded buffer audio and temporary solo/audition states are not.
+- Audio buffers are allocated during preparation. Spectrum analysis and drawing run on the interface thread.
 
-The spectrum reads input audio before granular processing. Its FFT runs on the GUI thread. Spectrum samples and grain-display snapshots pass from the audio thread through bounded FIFOs. The grain display represents the selected module's recording head and active read heads.
+## Build from source
 
-## Build
+Requirements:
 
-### Requirements
+- Windows x64 and PowerShell.
+- Visual Studio 2022 C++ build tools with a Windows SDK.
+- CMake 3.22 or newer, on `PATH` or bundled with Visual Studio.
+- Git and network access for the initial JUCE download.
 
-- Windows x64.
-- Visual Studio 2022 C++ build tools and a Windows SDK.
-- CMake 3.22 or newer, either on `PATH` or bundled with Visual Studio.
-- Git and network access for the initial JUCE checkout.
-- PowerShell.
-
-From the repository root:
+Run from the repository root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-The script clones JUCE tag `8.0.12` into `JUCE` if that directory lacks `CMakeLists.txt`, configures the Visual Studio 2022 x64 generator, builds Release targets, and runs both CTest suites. An existing JUCE checkout is reused without a version check.
+The script downloads JUCE tag `8.0.12` if it is missing, builds the Release plugin, and runs the tests. An existing JUCE checkout is reused.
 
-The generated plugin bundle is:
+Output:
 
 ```text
 build/Granular_artefacts/Release/VST3/Banded Grains.vst3/
 ```
 
-`JUCE/`, `build/`, and `dist/` are excluded from Git. The build script does not package a ZIP archive or install the plugin.
+Build outputs and the downloaded JUCE source are excluded from the repository. The script does not install the plugin or create a ZIP package.
 
-### Installation
+## Installation
 
-Copy the entire `.vst3` bundle directory to a host-scanned VST3 location. The standard system directory is:
+Copy the entire `Banded Grains.vst3` bundle folder to a VST3 location scanned by your DAW. The standard Windows directory is:
 
 ```text
 C:\Program Files\Common Files\VST3\
 ```
 
-Alternatively, configure the host to scan a custom directory. Close active plugin instances before replacing a bundle, then rescan in the host. The plugin is listed as **Banded Grains**, with manufacturer **Granular**.
+You can also use a custom scan directory if your DAW supports it. Close active plugin instances before replacing the bundle, then rescan in your DAW. Look for **Banded Grains** under manufacturer **Granular**.
 
-## Tests
+## Development
 
-`build.ps1` runs the following suites after building:
-
-| CTest target | Coverage |
+| File | Purpose |
 | --- | --- |
-| `GranularEngineTests` | Dry passthrough, wet output, pitch selection, feedback timing and damping, playback controls, freeze, buffer wraparound, stereo alignment, finite output under parameter changes, and reinitialization |
-| `GranularPluginCheck` | VST3 discovery/loading, editor interactions, crossover reconstruction and isolation, frequency-specific routing, state recall, mono/stereo layouts, variable block sizes, modulation, reordered crossover dragging, and audition reset after automated band-count changes |
-
-Engine and crossover checks include 44.1, 48, and 96 kHz. Plugin layout checks exercise block sizes of 1, 64, 257, and 1024 samples. The audio processor subdivides host buffers into chunks of at most 256 samples using buffers allocated during preparation.
-
-For an editor PNG, run the plugin-check executable with an optional output path after the VST3 path:
-
-```powershell
-& '.\build\GranularPluginCheck_artefacts\Release\GranularPluginCheck.exe' `
-    '.\build\Granular_artefacts\Release\VST3\Banded Grains.vst3' `
-    '.\build\editor-preview.png'
-```
-
-This also writes `playback-preview.png` beside the requested image.
-
-## Source layout
-
-| Path | Responsibility |
-| --- | --- |
-| `Source/GranularEngine.h` | JUCE-independent grain engine, recording buffers, envelopes, pitch, and feedback |
-| `Source/BandSplitter.h` | Linkwitz-Riley crossover bank, phase compensation, and cutoff smoothing |
-| `Source/PluginProcessor.cpp` | Host integration, routing, module processing, modulation, parameters, and state |
-| `Source/PluginEditor.cpp` | Spectrum, routing controls, grain visualization, envelope editing, and cable interaction |
+| `Source/GranularEngine.h` | Grain playback, recording buffers, envelopes, pitch, and feedback |
+| `Source/BandSplitter.h` | Crossovers and phase compensation |
+| `Source/PluginProcessor.cpp` | Audio routing, modules, modulation, parameters, and saved state |
+| `Source/PluginEditor.cpp` | Spectrum, controls, grain display, and patch cables |
 | `Tests/GranularEngineTests.cpp` | DSP engine tests |
-| `Tests/PluginCheck.cpp` | Plugin integration and editor tests |
-| `CMakeLists.txt` | Plugin and test targets |
-| `build.ps1` | Windows dependency checkout, build, and test entry point |
+| `Tests/PluginCheck.cpp` | VST3 loading, routing, state recall, modulation, and interface tests |
 
-## Dependency licensing
+The build runs both test suites automatically. Tests cover engine and crossover behavior at 44.1, 48, and 96 kHz, along with mono/stereo operation and variable host block sizes.
 
-JUCE is a third-party dependency with separate licensing terms. Its license is available at `JUCE/LICENSE.md` after checkout.
+JUCE has separate licensing terms. See `JUCE/LICENSE.md` after downloading the dependency.
