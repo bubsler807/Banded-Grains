@@ -294,7 +294,7 @@ public:
             if (grain.speed == 0) continue;
             const float x = r.getX() + grain.position * r.getWidth(), y = r.getY() + 4 + (i % 6) * (r.getHeight() - 8) / 6;
             const float direction = grain.speed < 0 ? -1.0f : 1.0f;
-            g.setColour(bandColours[module].withAlpha(0.5f + 0.5f * grain.amplitude));
+            g.setColour(bandColours[grain.group < 0 ? module : (module + grain.group + 1) % maxBands].withAlpha(0.5f + 0.5f * grain.amplitude));
             g.drawLine(juce::jlimit(r.getX(), r.getRight(), x - direction * 22), y, x, y, 2.5f);
             g.fillEllipse(x - 3, y - 3, 6, 6);
             g.drawLine(x, y, x - direction * 4, y - 3, 1);
@@ -309,20 +309,26 @@ private:
 class GranularEditor::Socket final : public juce::Component
 {
 public:
-    Socket(GranularEditor& e, int index, bool output) : owner(e), number(index), isOutput(output)
+    Socket(GranularEditor& e, int index, bool output, bool module = false) : owner(e), number(index), isOutput(output), isModule(module)
     {
-        setComponentID((output ? "modOutput" : "modInput") + juce::String(index));
+        setComponentID((module ? "moduleInput" : output ? "modOutput" : "modInput") + juce::String(index));
         setMouseCursor(juce::MouseCursor::PointingHandCursor);
-        setTitle(output ? "Modulator output " + juce::String(index + 1) : "Modulation input " + juce::String(index + 1));
+        setTitle(module ? "Module " + juce::String(index + 1) + " modulation inputs" : output ? "Modulator output " + juce::String(index + 1) : "Modulation input " + juce::String(index + 1));
     }
     void paint(juce::Graphics& g) override
     {
-        g.setColour(isMouseOver() ? ink : muted);
+        g.setColour(isModule && number == owner.selectedModule ? paper : isMouseOver() ? ink : muted);
         g.drawEllipse(getLocalBounds().toFloat().reduced(3), 1.5f);
+        const auto centre = getLocalBounds().toFloat().getCentre();
+        juce::Path arrow;
+        if (isOutput) arrow.addTriangle(centre.x, centre.y - 3, centre.x - 2.5f, centre.y + 2, centre.x + 2.5f, centre.y + 2);
+        else arrow.addTriangle(centre.x, centre.y + 2.5f, centre.x - 2.5f, centre.y - 2, centre.x + 2.5f, centre.y - 2);
+        g.fillPath(arrow);
+        if (isModule) return;
         if (isOutput)
         {
             g.setColour(bandColours[owner.selectedModule].withAlpha(0.3f + 0.7f * std::abs(owner.processor.modulationOutput(number))));
-            g.fillEllipse(getLocalBounds().toFloat().reduced(6));
+            g.fillPath(arrow);
         }
         else
         {
@@ -345,10 +351,11 @@ public:
             }
         }
     }
-    void mouseEnter(const juce::MouseEvent&) override { if (isOutput) owner.hoveredSource = number; else owner.hoveredTarget = number; owner.repaint(); }
-    void mouseExit(const juce::MouseEvent&) override { if (isOutput) owner.hoveredSource = -1; else owner.hoveredTarget = -1; owner.repaint(); }
+    void mouseEnter(const juce::MouseEvent&) override { if (isOutput) owner.hoveredSource = number; else if (isModule) owner.hoveredModule = number; else owner.hoveredTarget = number; owner.repaint(); }
+    void mouseExit(const juce::MouseEvent&) override { if (isOutput) owner.hoveredSource = -1; else if (isModule) owner.hoveredModule = -1; else owner.hoveredTarget = -1; owner.repaint(); }
     void mouseDown(const juce::MouseEvent& e) override
     {
+        if (isModule) { owner.selectModule(number); owner.hoveredModule = number; owner.repaint(); return; }
         if (!isOutput)
         {
             for (int source = 0; source < owner.shownModCount; ++source)
@@ -377,6 +384,9 @@ public:
         for (int module = 0; module < GranularProcessor::maxBands; ++module)
             if (module != owner.selectedModule && owner.tabs[module].getBounds().toFloat().contains(owner.wireEnd))
             { owner.selectModule(module); break; }
+        for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+            if (owner.fractionViewport.isVisible() && owner.fractionButtons[group].isVisible() && owner.getLocalArea(&owner.fractionButtons[group], owner.fractionButtons[group].getLocalBounds()).toFloat().contains(owner.wireEnd)
+                && owner.fractionViewport.getBounds().toFloat().contains(owner.wireEnd)) owner.showFraction(group);
         if (owner.grainsPage.getBounds().toFloat().contains(owner.wireEnd)) owner.showPlayback(false);
         if (owner.playbackPage.getBounds().toFloat().contains(owner.wireEnd)) owner.showPlayback(true);
         owner.repaint();
@@ -386,8 +396,8 @@ public:
         if (!isOutput || owner.draggingSource < 0) return;
         const auto end = e.getEventRelativeTo(&owner).position;
         for (int target = 0; target < GranularProcessor::modTargetCount; ++target)
-            if (owner.inputSockets[target]->isVisible()
-                && owner.inputSockets[target]->getBounds().toFloat().expanded(7).contains(end))
+            if (owner.inputVisible(target)
+                && owner.inputBounds(target).toFloat().expanded(5).contains(end))
             { owner.connectModulator(number, target); break; }
         owner.draggingSource = -1;
         owner.repaint();
@@ -395,7 +405,7 @@ public:
 private:
     GranularEditor& owner;
     int number;
-    bool isOutput;
+    bool isOutput, isModule;
 };
 
 class GranularEditor::EffectCard final : public juce::Component
@@ -523,6 +533,19 @@ GranularEditor::GranularEditor(GranularProcessor& p)
     addAndMakeVisible(*spectrum);
     addAndMakeVisible(*envelope);
     addAndMakeVisible(*grainView);
+    fractionViewport.setComponentID("fractionList");
+    fractionViewport.setViewedComponent(&fractionListContent, false);
+    fractionViewport.setScrollBarsShown(true, false); fractionViewport.setScrollBarThickness(12);
+    addAndMakeVisible(fractionViewport); addAndMakeVisible(addFractionButton);
+    addFractionButton.setComponentID("addFraction");
+    originalFractionLabel.setFont(sans(12)); originalFractionLabel.setColour(juce::Label::textColourId, muted);
+    fractionListContent.addAndMakeVisible(originalFractionLabel);
+    addFractionButton.onClick = [this]
+    {
+        const int next = processor.activeFractions(selectedModule);
+        processor.addFraction(selectedModule); refreshFractionList();
+        if (processor.activeFractions(selectedModule) > next) { showFraction(next); fractionViewport.setViewPosition(0, next * 44); }
+    };
     grainsPage.setComponentID("grainsPage"); playbackPage.setComponentID("playbackPage");
     grainsPage.onClick = [this] { showPlayback(false); };
     playbackPage.onClick = [this] { showPlayback(true); };
@@ -621,13 +644,13 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         sliders[i].setTitle(juce::StringArray{"Grain size", "Density", "Dry / Wet", "Grain shape"}[i]);
         addAndMakeVisible(sliders[i]);
     }
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < GranularProcessor::fractionCount; ++i)
     {
-        for (auto* slider : { &pitchSteps[i], &pitchChances[i] })
+        for (auto* slider : std::array<juce::Slider*, 2>{ &pitchSteps[i], &pitchChances[i] })
         {
             slider->setSliderStyle(juce::Slider::LinearHorizontal);
             slider->setTextBoxStyle(juce::Slider::TextBoxRight, false, 66, 24);
-            addAndMakeVisible(*slider);
+            fractionListContent.addAndMakeVisible(*slider);
         }
         pitchSteps[i].setComponentID("pitch" + juce::String(i));
         pitchSteps[i].setTitle("Pitch choice " + juce::String(i + 1) + " semitones");
@@ -723,6 +746,15 @@ GranularEditor::GranularEditor(GranularProcessor& p)
         row.target.addItemList({"Grain size", "Density", "Dry / Wet", "Attack slope", "Release slope", "Feedback", "Repeat time", "Damping",
             "Pitch 1", "Pitch 2", "Pitch 3", "Pitch 4", "Chance 1", "Chance 2", "Chance 3", "Chance 4",
             "Position", "Spray", "Base pitch", "Reverse chance", "Stereo spread", "Freeze"}, 1);
+        for (int group = 0; group < 4; ++group)
+            for (const auto* control : GranularProcessor::fractionControls)
+                row.target.addItem("Fraction " + juce::String(group + 1) + " " + control, row.target.getNumItems() + 1);
+        for (int group = 4; group < GranularProcessor::fractionCount; ++group)
+        {
+            row.target.addItem("Fraction " + juce::String(group + 1) + " pitch", row.target.getNumItems() + 1);
+            row.target.addItem("Fraction " + juce::String(group + 1) + " share", row.target.getNumItems() + 1);
+            for (const auto* control : GranularProcessor::fractionControls) row.target.addItem("Fraction " + juce::String(group + 1) + " " + control, row.target.getNumItems() + 1);
+        }
         row.target.setComponentID("connectionTarget" + juce::String(link));
         connectionStrip.addAndMakeVisible(row.target);
         row.depth.setColour(juce::Slider::textBoxTextColourId, ink);
@@ -741,12 +773,53 @@ GranularEditor::GranularEditor(GranularProcessor& p)
     {
         inputSockets[i] = std::make_unique<Socket>(*this, i, false);
         inputSockets[i]->setTitle("Modulation input: " + juce::String(GranularProcessor::modTargets[i]));
-        addAndMakeVisible(*inputSockets[i]);
+        if (GranularProcessor::targetFraction(i) >= 0 && GranularProcessor::targetFractionControl(i) < 2)
+            fractionListContent.addAndMakeVisible(*inputSockets[i]);
+        else addAndMakeVisible(*inputSockets[i]);
     }
     for (int i = 0; i < GranularProcessor::maxModulators; ++i)
     {
         outputSockets[i] = std::make_unique<Socket>(*this, i, true);
         addAndMakeVisible(*outputSockets[i]);
+    }
+    for (int module = 0; module < maxBands; ++module)
+    {
+        moduleSockets[module] = std::make_unique<Socket>(*this, module, false, true);
+        addAndMakeVisible(*moduleSockets[module]);
+    }
+    for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+    {
+        fractionButtons[group].setButtonText("Fraction " + juce::String(group + 1) + " / FX");
+        fractionButtons[group].setComponentID("fraction" + juce::String(group));
+        fractionButtons[group].onClick = [this, group] { showFraction(group); };
+        fractionListContent.addAndMakeVisible(fractionButtons[group]);
+        removeFractionButtons[group].setButtonText("Remove"); removeFractionButtons[group].setComponentID("removeFraction" + juce::String(group));
+        removeFractionButtons[group].onClick = [this, group]
+        {
+            processor.removeFraction(selectedModule, group); refreshFractionList();
+            selectedFraction = juce::jlimit(0, juce::jmax(0, processor.activeFractions(selectedModule) - 1), selectedFraction);
+            if (processor.activeFractions(selectedModule) == 0) showPlayback(false);
+            else if (fractionsVisible) showFraction(selectedFraction);
+        };
+        fractionListContent.addAndMakeVisible(removeFractionButtons[group]);
+        pitchChances[group].limit = [this, group](double value) { return juce::jlimit(0.0, static_cast<double>(processor.availableFractionShare(selectedModule, group)), value); };
+        pitchChances[group].setTitle("Fraction " + juce::String(group + 1) + " percentage of grains");
+        pitchSteps[group].setTextValueSuffix(" st");
+        pitchSteps[group].setTitle("Fraction " + juce::String(group + 1) + " pitch offset");
+        pitchChances[group].setTooltip("Percentage of grain launches assigned to this fraction. Limited to the percentage not already assigned to other fractions.");
+    }
+    for (int i = 0; i < GranularProcessor::fractionControlCount; ++i)
+    {
+        auto& slider = fractionSliders[i];
+        slider.setComponentID("fractionFx" + juce::String(i));
+        slider.setTitle(juce::StringArray{"Drive", "Distortion mix", "Reverb mix", "Room size", "Damping", "EQ low", "EQ mid", "EQ high"}[i]);
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 80, 24);
+        slider.setTextValueSuffix(i == 0 || i >= 5 ? " dB" : " %");
+        slider.setColour(juce::Slider::textBoxTextColourId, ink);
+        slider.setColour(juce::Slider::textBoxBackgroundColourId, paper);
+        slider.setColour(juce::Slider::textBoxOutlineColourId, rule);
+        addAndMakeVisible(slider);
     }
     selectModule(0);
     setSize(1100, 1050);
@@ -758,8 +831,9 @@ GranularEditor::~GranularEditor() { stopTimer(); setLookAndFeel(nullptr); }
 void GranularEditor::selectModule(int module)
 {
     selectedModule = juce::jlimit(0, maxBands - 1, module);
-    if (draggingSource < 0) { hoveredSource = -1; hoveredTarget = -1; }
+    if (draggingSource < 0) { hoveredSource = -1; hoveredTarget = -1; hoveredModule = -1; }
     refreshModulation();
+    refreshFraction();
     for (int band = 0; band < processor.bandCount(); ++band)
         if (juce::roundToInt(processor.value("route" + juce::String(band))) == selectedModule)
         {
@@ -787,7 +861,7 @@ void GranularEditor::selectModule(int module)
     }
     for (auto& attachment : stepAttachments) attachment.reset();
     for (auto& attachment : chanceAttachments) attachment.reset();
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < GranularProcessor::fractionCount; ++i)
     {
         stepAttachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
             processor.parameters, GranularProcessor::moduleID(selectedModule, "pitch" + juce::String(i)), pitchSteps[i]);
@@ -797,6 +871,7 @@ void GranularEditor::selectModule(int module)
         pitchSteps[i].setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
         pitchChances[i].setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
     }
+    refreshFractionList();
     const juce::StringArray ids {"size", "density", "mix", "shape"};
     envelope->select(selectedModule);
     for (int i = 0; i < maxBands; ++i)
@@ -807,6 +882,11 @@ void GranularEditor::selectModule(int module)
         sliders[i].setTextValueSuffix(juce::StringArray{" ms", " /s", " %", " %"}[i]);
         attachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
             processor.parameters, GranularProcessor::moduleID(selectedModule, ids[i]), sliders[i]);
+    }
+    if (fractionsVisible)
+    {
+        if (processor.activeFractions(selectedModule) == 0) showPlayback(false);
+        else showFraction(juce::jmin(selectedFraction, processor.activeFractions(selectedModule) - 1));
     }
     repaint();
 }
@@ -824,11 +904,35 @@ void GranularEditor::resized()
         const int left = 32 + i * (getWidth() - 64) / maxBands;
         const int right = 32 + (i + 1) * (getWidth() - 64) / maxBands;
         tabs[i].setBounds(left, 407, right - left, 22);
+        moduleSockets[i]->setBounds(right - 16, 410, 16, 16);
         moduleSoloButtons[i].setBounds(right - 35, 409, 18, 18);
         if (i < 3) sliders[i].setBounds(132, 480 + i * 44, 175, 38);
     }
     grainsPage.setBounds(42, 450, 105, 24); playbackPage.setBounds(150, 450, 115, 24);
     effectsPage.setBounds(275, 450, 75, 24);
+    const std::array<int, 8> columns {0, 0, 1, 1, 1, 2, 2, 2};
+    const std::array<int, 8> rows {0, 1, 0, 1, 2, 0, 1, 2};
+    for (int i = 0; i < GranularProcessor::fractionControlCount; ++i)
+    {
+        const int x = 42 + columns[i] * 354, y = 480 + rows[i] * 44;
+        fractionSliders[i].setBounds(x + 105, y, 200, 38);
+        for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+            inputSockets[GranularProcessor::fractionTarget(group, i + 2)]->setBounds(x + 86, y + 10, 18, 18);
+    }
+    addFractionButton.setBounds(getWidth() - 175, 677, 133, 26);
+    fractionViewport.setBounds(42, 727, getWidth() - 84, 107);
+    fractionListContent.setSize(getWidth() - 100, (juce::jmax(0, displayedFractions) + 1) * 44);
+    for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+    {
+        const int y = group * 44;
+        fractionButtons[group].setBounds(0, y + 6, 190, 28);
+        pitchChances[group].setBounds(235, y + 5, 300, 30);
+        pitchSteps[group].setBounds(573, y + 5, 265, 30);
+        removeFractionButtons[group].setBounds(870, y + 6, 110, 28);
+        inputSockets[GranularProcessor::fractionTarget(group, 1)]->setBounds(213, y + 11, 18, 18);
+        inputSockets[GranularProcessor::fractionTarget(group, 0)]->setBounds(550, y + 11, 18, 18);
+    }
+    originalFractionLabel.setBounds(0, juce::jmax(0, displayedFractions) * 44, 970, 38);
     effectLaneSelector.setBounds(42, 489, 250, 28);
     effectLaneMix.setBounds(405, 489, 260, 28); effectLaneGain.setBounds(790, 489, 250, 28);
     effectViewport.setBounds(42, 550, getWidth() - 84, 282);
@@ -866,17 +970,10 @@ void GranularEditor::resized()
     for (int i = 0; i < 8; ++i) inputSockets[i]->setBounds(sockets[i].x - 9, sockets[i].y - 9, 18, 18);
     for (int i = 0; i < 4; ++i)
     {
-        inputSockets[8 + i]->setBounds(32 + i * width, 732, 18, 18);
-        inputSockets[12 + i]->setBounds(32 + i * width, 785, 18, 18);
         outputSockets[i]->setBounds(710 + i * 90, 855, 22, 22);
     }
     envelope->setBounds(340, 478, getWidth() - 720, 132);
     for (int i = 0; i < 3; ++i) feedbackSliders[i].setBounds(getWidth() - 238, 480 + i * 44, 196, 38);
-    for (int i = 0; i < 4; ++i)
-    {
-        pitchSteps[i].setBounds(42 + i * width, 725, width - 20, 32);
-        pitchChances[i].setBounds(42 + i * width, 778, width - 20, 32);
-    }
 }
 void GranularEditor::timerCallback()
 {
@@ -915,6 +1012,11 @@ void GranularEditor::timerCallback()
     const int links = modCount > 0 ? juce::roundToInt(processor.value(GranularProcessor::modID(juce::jmin(selectedSource, modCount - 1), "connections"))) : 0;
     if (modCount != shownModCount || links != shownConnections) refreshModulation();
     modRate.setEnabled(modCount > 0 && modSync.getSelectedItemIndex() == 0);
+    if (processor.activeFractions(selectedModule) != displayedFractions) refreshFractionList();
+    float usedShare = 0;
+    for (int group = 0; group < processor.activeFractions(selectedModule); ++group)
+        usedShare += juce::jlimit(0.0f, 100.0f - usedShare, processor.value(GranularProcessor::moduleID(selectedModule, "chance" + juce::String(group))));
+    originalFractionLabel.setText("Original grains  /  " + juce::String(100 - usedShare, 1) + "%  /  no fraction FX", juce::dontSendNotification);
     if (effectsVisible) effectChain->refresh();
     envelope->repaint();
     grainView->update();
@@ -939,7 +1041,19 @@ void GranularEditor::paint(juce::Graphics& g)
     }
     else
     {
-    if (!playbackVisible)
+    if (fractionsVisible)
+    {
+        g.setColour(ink); g.setFont(serif(17));
+        g.drawText("Fraction " + juce::String(selectedFraction + 1) + " effects", 365, 450, 390, 24, juce::Justification::centredLeft);
+        const std::array<int, 8> columns {0, 0, 1, 1, 1, 2, 2, 2};
+        const std::array<int, 8> rows {0, 1, 0, 1, 2, 0, 1, 2};
+        for (int i = 0; i < 8; ++i)
+            g.drawText(juce::StringArray{"Drive", "Distortion", "Reverb", "Room size", "Damping", "EQ low", "EQ mid", "EQ high"}[i],
+                42 + columns[i] * 354, 485 + rows[i] * 44, 85, 24, juce::Justification::centredLeft);
+        g.setColour(muted); g.setFont(sans(11));
+        g.drawText("EQ > Distortion > Reverb", 42, 580, 300, 22, juce::Justification::centredLeft);
+    }
+    else if (!playbackVisible)
     {
     for (int i = 0; i < 3; ++i)
     {
@@ -961,20 +1075,15 @@ void GranularEditor::paint(juce::Graphics& g)
     }
     g.setColour(rule); g.drawHorizontalLine(669, 32, getWidth() - 32.0f);
     g.setColour(ink); g.setFont(serif(18));
-    g.drawText("Pitch randomization", 42, 679, 300, 24, juce::Justification::centredLeft);
-    float total = 0;
-    for (int i = 0; i < 4; ++i) total += processor.value(GranularProcessor::moduleID(selectedModule, "chance" + juce::String(i)));
+    g.drawText("Grain fractions", 42, 679, 300, 24, juce::Justification::centredLeft);
     g.setFont(sans(12)); g.setColour(muted);
-    g.drawText("Original pitch: " + juce::String(juce::jmax(0.0f, 100.0f - total), 1) + "%", 600, 679, 338, 24, juce::Justification::centredRight);
-    for (int i = 0; i < 4; ++i)
-    {
-        const int x = 42 + i * width;
-        g.drawText("Choice " + juce::String(i + 1) + " / semitones", x, 706, width - 20, 18, juce::Justification::centredLeft);
-        const float chance = processor.value(GranularProcessor::moduleID(selectedModule, "chance" + juce::String(i)))
-            * 100.0f / juce::jmax(100.0f, total);
-        g.drawText("Chance: " + juce::String(chance, 1) + "%", x, 760, width - 20, 18, juce::Justification::centredLeft);
-    }
-    g.drawText("Unused chance plays the original pitch. Totals above 100% are scaled proportionally.", 42, 819, 890, 20, juce::Justification::centredLeft);
+    float assignedShare = 0;
+    for (int group = 0; group < processor.activeFractions(selectedModule); ++group)
+        assignedShare += juce::jlimit(0.0f, 100.0f - assignedShare, processor.value(GranularProcessor::moduleID(selectedModule, "chance" + juce::String(group))));
+    g.drawText("Original grains: " + juce::String(100 - assignedShare, 1) + "%   /   Total: 100%", 340, 679, 570, 24, juce::Justification::centredLeft);
+    g.drawText("Fraction / effects", 42, 705, 190, 20, juce::Justification::centredLeft);
+    g.drawText("Grains (%)", 277, 705, 300, 20, juce::Justification::centredLeft);
+    g.drawText("Pitch (semitones)", 615, 705, 265, 20, juce::Justification::centredLeft);
     }
     g.setColour(rule); g.drawHorizontalLine(846, 32, getWidth() - 32.0f);
     g.setColour(ink); g.setFont(serif(18));
@@ -1105,12 +1214,15 @@ void GranularEditor::removeConnection(int connection)
 }
 void GranularEditor::showPlayback(bool playback)
 {
+    fractionsVisible = false;
+    for (auto& slider : fractionSliders) slider.setVisible(false);
+    fractionViewport.setVisible(true); addFractionButton.setVisible(true);
+    for (auto& button : fractionButtons) button.setToggleState(false, juce::dontSendNotification);
+    for (int i = 22; i < GranularProcessor::modTargetCount; ++i) inputSockets[i]->setVisible(false);
     effectsVisible = false;
     effectsPage.setToggleState(false, juce::dontSendNotification);
     for (auto* component : std::array<juce::Component*, 4>{&effectLaneSelector, &effectViewport, &effectLaneMix, &effectLaneGain}) component->setVisible(false);
-    for (auto& slider : pitchSteps) slider.setVisible(true);
-    for (auto& slider : pitchChances) slider.setVisible(true);
-    for (int i = 8; i < 16; ++i) inputSockets[i]->setVisible(true);
+    refreshFractionList();
     grainView->setVisible(true);
     playbackVisible = playback;
     grainsPage.setToggleState(!playback, juce::dontSendNotification);
@@ -1121,7 +1233,7 @@ void GranularEditor::showPlayback(bool playback)
     for (auto& slider : playbackSliders) slider.setVisible(playback);
     freezeButton.setVisible(playback);
     for (int i = 0; i < 8; ++i) inputSockets[i]->setVisible(!playback);
-    for (int i = 16; i < GranularProcessor::modTargetCount; ++i) inputSockets[i]->setVisible(playback);
+    for (int i = 16; i < 22; ++i) inputSockets[i]->setVisible(playback);
     hoveredTarget = -1;
     repaint();
 }
@@ -1137,6 +1249,7 @@ void GranularEditor::showEffects(bool show)
     showPlayback(false);
     if (!show) return;
     effectsVisible = true;
+    fractionViewport.setVisible(false); addFractionButton.setVisible(false);
     grainsPage.setToggleState(false, juce::dontSendNotification);
     effectsPage.setToggleState(true, juce::dontSendNotification);
     for (auto& slider : sliders) slider.setVisible(false);
@@ -1185,13 +1298,8 @@ void GranularEditor::showEffectMenu()
 }
 void GranularEditor::paintOverChildren(juce::Graphics& g)
 {
-    for (int module = 0; module < maxBands; ++module)
-    {
-        g.setColour(module == selectedModule ? paper : muted);
-        g.drawEllipse(static_cast<float>(tabs[module].getRight() - 12), 414.5f, 7, 7, 1.2f);
-    }
     const int selectedOutput = draggingSource >= 0 ? draggingSource : hoveredSource;
-    if (selectedOutput < 0 && hoveredTarget < 0) return;
+    if (selectedOutput < 0 && hoveredTarget < 0 && hoveredModule < 0) return;
     auto drawWire = [&](juce::Point<float> start, juce::Point<float> end, int colour)
     {
         juce::Path path; path.startNewSubPath(start);
@@ -1211,20 +1319,78 @@ void GranularEditor::paintOverChildren(juce::Graphics& g)
                 juce::roundToInt(processor.value(GranularProcessor::connectionID(source, link, "target"))));
             const int module = juce::jlimit(0, maxBands - 1,
                 juce::roundToInt(processor.value(GranularProcessor::connectionID(source, link, "module"))));
-            if (selectedOutput < 0 && (module != selectedModule || target != hoveredTarget)) continue;
+            if (selectedOutput < 0 && (hoveredModule >= 0 ? module != hoveredModule : module != selectedModule || target != hoveredTarget)) continue;
             if (module == selectedModule)
             {
-                const auto end = inputSockets[target]->isVisible() ? inputSockets[target]->getBounds().getCentre().toFloat()
-                    : (target >= 16 ? playbackPage : grainsPage).getBounds().getCentre().toFloat();
+                const auto end = inputVisible(target) ? inputBounds(target).getCentre().toFloat()
+                    : (GranularProcessor::targetFraction(target) >= 0 ? fractionViewport
+                        : target >= 16 ? static_cast<juce::Component&>(playbackPage) : static_cast<juce::Component&>(grainsPage)).getBounds().getCentre().toFloat();
                 drawWire(start, end, module);
             }
             else
             {
-                drawWire(start, {static_cast<float>(tabs[module].getRight() - 8), 418}, module);
+                drawWire(start, moduleSockets[module]->getBounds().getCentre().toFloat(), module);
                 g.setColour(bandColours[module]); g.drawRect(tabs[module].getBounds().toFloat().reduced(1), 2);
             }
         }
     }
     if (draggingSource >= 0 && draggingSource < shownModCount)
         drawWire(outputSockets[draggingSource]->getBounds().getCentre().toFloat(), wireEnd, selectedModule);
+}
+
+void GranularEditor::refreshFraction()
+{
+    for (auto& attachment : fractionAttachments) attachment.reset();
+    for (int i = 0; i < GranularProcessor::fractionControlCount; ++i)
+    {
+        fractionAttachments[i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.parameters,
+            GranularProcessor::fractionID(selectedModule, selectedFraction, GranularProcessor::fractionControls[i]), fractionSliders[i]);
+        fractionSliders[i].setColour(juce::Slider::trackColourId, bandColours[selectedModule]);
+    }
+}
+void GranularEditor::showFraction(int group)
+{
+    if (group < 0 || group >= processor.activeFractions(selectedModule)) return;
+    showPlayback(false);
+    fractionsVisible = true;
+    selectedFraction = juce::jlimit(0, GranularProcessor::fractionCount - 1, group);
+    grainsPage.setToggleState(false, juce::dontSendNotification);
+    for (int i = 0; i < GranularProcessor::fractionCount; ++i) fractionButtons[i].setToggleState(i == selectedFraction, juce::dontSendNotification);
+    for (auto& slider : sliders) slider.setVisible(false);
+    for (auto& slider : feedbackSliders) slider.setVisible(false);
+    envelope->setVisible(false);
+    for (int i = 0; i < 8; ++i) inputSockets[i]->setVisible(false);
+    for (auto& slider : fractionSliders) slider.setVisible(true);
+    for (int i = 0; i < GranularProcessor::fractionControlCount; ++i)
+        inputSockets[GranularProcessor::fractionTarget(selectedFraction, i + 2)]->setVisible(true);
+    refreshFraction();
+    repaint();
+}
+
+juce::Rectangle<int> GranularEditor::inputBounds(int target) const
+{
+    return getLocalArea(inputSockets[target].get(), inputSockets[target]->getLocalBounds());
+}
+bool GranularEditor::inputVisible(int target) const
+{
+    if (!inputSockets[target]->isShowing() && !inputSockets[target]->isVisible()) return false;
+    if (!inputSockets[target]->isVisible()) return false;
+    if (inputSockets[target]->getParentComponent() == &fractionListContent)
+        return fractionViewport.isVisible() && inputBounds(target).intersects(fractionViewport.getBounds());
+    return true;
+}
+void GranularEditor::refreshFractionList()
+{
+    displayedFractions = processor.activeFractions(selectedModule);
+    addFractionButton.setEnabled(displayedFractions < GranularProcessor::fractionCount);
+    for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+    {
+        const bool active = group < displayedFractions;
+        fractionButtons[group].setVisible(active); removeFractionButtons[group].setVisible(active);
+        pitchSteps[group].setVisible(active); pitchChances[group].setVisible(active);
+        inputSockets[GranularProcessor::fractionTarget(group, 0)]->setVisible(active);
+        inputSockets[GranularProcessor::fractionTarget(group, 1)]->setVisible(active);
+    }
+    if (getWidth() > 0) resized();
+    repaint();
 }

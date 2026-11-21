@@ -28,7 +28,15 @@ Select a module tab to edit its settings. The **Grains** panel contains timing, 
 | Repeat time | 10-2000 ms | Delay within the feedback loop |
 | Damping | 100-20000 Hz | Low-pass filtering in the feedback loop |
 
-Each module has four pitch choices from -24 to +24 semitones, each with its own probability. Unassigned probability plays without an additional pitch offset. If the probabilities add up to more than 100%, they are scaled proportionally.
+Each module has a scrollable **Grain fractions** list with **Add fraction** and **Remove** controls, supporting up to twelve fractions. A new list starts empty; add a row to configure a fraction. Their percentages divide the grain stream, rather than splitting the time or volume of each grain. Every grain is assigned to one fraction at launch and keeps that assignment until it ends. Percentages are per-grain probabilities, so short passages can differ from the long-run shares. A percentage cannot exceed the share not already assigned to the other fractions. Editing a percentage, adding a row, or removing a row never redistributes the other shares. The read-only **Original grains** row takes the remainder, so the full stream always totals 100%. New rows start at 0%.
+
+Click **Fraction 1 / FX** (or another fraction) to open its controls. Each fraction has its own pitch offset (-24 to +24 semitones), three-band EQ, distortion Drive/Mix, and reverb Mix/Room size/Damping. These can be combined; the processing order is pitch at grain launch, then EQ, distortion, and reverb. EQ uses 250 Hz and 4 kHz shelves with a 1 kHz mid bell. New fractions start at zero pitch, with all effect mixes at zero and EQ flat. Mix controls at zero and flat EQ bypass those processors.
+
+For example, Fraction 1 at 30% with +12 semitones and Fraction 2 at 70% with reverb assigns about 30% of grains to the pitched group and 70% to the reverberant group. Set a fraction's percentage to zero to stop sending new grains into it; reverb tails and already-running grains continue. Removing a row returns its percentage to Original grains, deletes its cables, and remaps surviving fraction cables. Removal briefly clears that module's active grains and fraction effect buffers while retaining its recording buffer. Unassigned grains receive the module's normal granular playback but bypass fraction-specific pitch and effects.
+
+Each fraction has an independent stereo effects state, shared only by grains assigned to that fraction. Fraction effects run after the module's grain/feedback loop and before its Dry/Wet mix and module solo; the feedback loop re-granulates pre-fraction-FX audio. Fraction reverb does not feed back into the recording buffer. Band and Master effects lanes remain separate.
+
+Fraction controls accept modulation cables and DAW automation. The old pitch-choice and probability IDs are retained: existing fixed-four patches load as four list rows with their saved pitch offsets, percentages, and effects; missing effects use bypass defaults. The grain display colors heads by their assigned fraction.
 
 Feedback is taken before the dry/wet mix, so changing the mix does not change the feedback amount. The loop includes saturation and damping to control buildup. Repeat time sets the delay within this loop; grain capture and playback add to the audible repeat interval. Changing repeat time smoothly can bend the pitch of the return.
 
@@ -40,7 +48,7 @@ The **Playback** panel controls which part of the buffer is used and how each gr
 | --- | --- | --- |
 | Position | 0-1500 ms | Additional lookback into previously recorded audio |
 | Spray | 0-1000 ms | Width of the random position variation around Position |
-| Base pitch | -24 to +24 semitones | Transposition applied alongside the four pitch choices |
+| Base pitch | -24 to +24 semitones | Transposition applied alongside each fraction's pitch offset |
 | Reverse chance | 0-100% | Probability that a new grain plays backward |
 | Stereo spread | 0-100% | Random stereo balance for each grain; inactive in mono |
 | Freeze | Off / On | Holds the recorded buffer while grains continue playing |
@@ -68,9 +76,9 @@ Up to four shared modulators (LFO or Random) can modulate controls across all mo
 
 LFO waveforms are sine, triangle, ramp up, ramp down, square, and random hold. LFOs run at 0.02-20 Hz or follow tempo-based cycles from a sixteenth note to 16 beats.
 
-To connect a modulator, drag its output socket onto a control's input socket. Hover a module tab while dragging to switch modules. Hover a socket to display its cables, or click a connected input to select its connection. Each new connection has a signed depth, shown and editable in the destination control's units. New connections start at zero depth. Positive depth raises the value as the source rises; negative depth lowers it.
+To connect a modulator, drag its output socket onto a control's input socket. Hover a module tab while dragging to switch modules. Up-arrow sockets are outputs and down-arrow sockets are inputs. Hover a socket to display its cables, or click a connected input to select its connection. Module input icons reveal all incoming cables for that module and open it when clicked. Fraction row sockets remain aligned while scrolling; hidden controls reject drops. Each new connection has a signed depth, shown and editable in the destination control's units. New connections start at zero depth. Positive depth raises the value as the source rises; negative depth lowers it.
 
-Connected input sockets show the resulting value with a small moving indicator. Modulation acts on the processing value without changing the underlying knob or DAW automation value. Contributions from all connections targeting a control are added to its base value, then the result is limited and rounded to the control's allowed range. A depth of 100% in DAW automation represents the full destination range; for pitch, 25% is 12 semitones. Bipolar sources move above and below the base setting.
+Connected input sockets show the resulting value with a small moving indicator. Modulation acts on the processing value without changing the underlying knob or DAW automation value. Contributions from all connections targeting a control are added to its base value, then the result is limited and rounded to the control's allowed range. A depth of 100% in DAW automation represents the full destination range; for pitch, 25% is 12 semitones. Bipolar sources move above and below the base setting. Fraction percentage modulation is capped by the available Original grains share and cannot steal another fraction's allocation.
 
 The dedicated **Random** type has Rate, tempo sync, Smooth, Jitter, and Chaos controls. Smooth blends between values; Jitter varies their timing; Chaos limits each change. At zero Chaos the target holds. Each source has an independent deterministic sequence, reset on playback preparation. Random uses the same connections, signed depths, and polarity as LFOs.
 
@@ -84,7 +92,7 @@ Click the empty lane or **+ Add effect** to open a picker, then choose **Distort
 
 Distortion uses a simple soft-clipping waveshaper with Drive and Mix. Reverb provides Room size, Damping, Mix, and Width. The 3-Band EQ has low and high shelves at 250 Hz and 4 kHz, a mid bell at 1 kHz, gains from -18 to +18 dB, and Mix. New lanes start empty; added effects start enabled, with reverb Mix at 25% and the EQ gains flat.
 
-Effect controls support DAW automation and session recall; they are not destinations in the internal modulation system yet. Reverb buffers reset on preparation, state recall, and band insertion/removal. Moving or removing an effect resets the affected insert buffers.
+Band and Master lane effect controls support DAW automation and session recall; those lane controls are not internal modulation destinations. Fraction effect controls do support internal modulation. Reverb buffers reset on preparation, state recall, and band insertion/removal. Moving or removing an effect resets the affected insert buffers.
 
 Adding a split copies the lower band's effects into the new band; existing higher bands keep their settings. Removing a split retains the lower band's effects and shifts higher lanes along with their bands. Changing the band count directly through automation retains settings by band slot.
 

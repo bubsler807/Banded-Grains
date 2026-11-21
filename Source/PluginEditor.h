@@ -21,6 +21,11 @@ private:
     void showEffects(bool);
     void refreshEffects();
     void showEffectMenu();
+    void showFraction(int);
+    void refreshFraction();
+    void refreshFractionList();
+    juce::Rectangle<int> inputBounds(int) const;
+    bool inputVisible(int) const;
     void updateModulatorType();
     void refreshModulation();
     void connectModulator(int source, int target);
@@ -59,8 +64,24 @@ private:
     std::array<juce::Slider, 3> feedbackSliders;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> feedbackAttachments;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 3> attachments;
-    std::array<juce::Slider, 4> pitchSteps, pitchChances;
-    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> stepAttachments, chanceAttachments;
+    struct ShareSlider final : juce::Slider
+    {
+        std::function<double(double)> limit;
+        double snapValue(double value, DragMode) override { return limit ? limit(value) : value; }
+    };
+    std::array<juce::Slider, GranularProcessor::fractionCount> pitchSteps;
+    std::array<ShareSlider, GranularProcessor::fractionCount> pitchChances;
+    std::array<juce::TextButton, GranularProcessor::fractionCount> fractionButtons, removeFractionButtons;
+    juce::Component fractionListContent;
+    juce::Viewport fractionViewport;
+    juce::TextButton addFractionButton {"Add fraction"};
+    juce::Label originalFractionLabel;
+    int displayedFractions = -1;
+    std::array<juce::Slider, GranularProcessor::fractionControlCount> fractionSliders;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, GranularProcessor::fractionControlCount> fractionAttachments;
+    int selectedFraction = 0;
+    bool fractionsVisible = false;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, GranularProcessor::fractionCount> stepAttachments, chanceAttachments;
     juce::ComboBox sourceSelector, modWave, modSync, modPolarity, modType;
     juce::Slider modRate;
     std::array<juce::Slider, 3> randomSliders;
@@ -83,8 +104,9 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateAttachment;
     std::array<std::unique_ptr<Socket>, GranularProcessor::modTargetCount> inputSockets;
     std::array<std::unique_ptr<Socket>, GranularProcessor::maxModulators> outputSockets;
+    std::array<std::unique_ptr<Socket>, GranularProcessor::maxBands> moduleSockets;
     int selectedSource = 0, shownModCount = -1, shownConnections = -1;
-    int draggingSource = -1, hoveredSource = -1, hoveredTarget = -1;
+    int draggingSource = -1, hoveredSource = -1, hoveredTarget = -1, hoveredModule = -1;
     juce::Point<float> wireEnd;
     juce::String patchMessage;
     int selectedModule = 0;

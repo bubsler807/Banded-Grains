@@ -7,6 +7,19 @@ void require(bool condition, const char* message)
 
 int main()
 {
+    {
+        GranularEngine::PitchChoices fractions {{0, 0, 0, 0}, {20, 30, 10, 0}};
+        std::array<int, 5> counts {};
+        for (int i = 0; i < 10000; ++i)
+        {
+            const int group = GranularEngine::chooseGroup(fractions, (i + 0.5f) / 10000.0f);
+            ++counts[group < 0 ? 4 : group];
+        }
+        require(counts == std::array<int, 5>{2000, 3000, 1000, 0, 4000}, "Fraction allocation ignored percentages or remainder");
+        fractions.chances = {100, 100, 0, 0};
+        require(GranularEngine::chooseGroup(fractions, 0.25f) == 0 && GranularEngine::chooseGroup(fractions, 0.75f) == 0,
+                "Fraction allocation exceeded its original-stream capacity");
+    }
     auto feedbackRender = [](float amount, float delay, float cutoff, bool dryInitially)
     {
         GranularEngine engine; engine.prepare(48000);
@@ -109,8 +122,8 @@ int main()
     }
     require(counts == std::array<int, 4>{2000, 3000, 1000, 4000}, "Pitch percentages or original remainder incorrect");
     choices.chances = {100, 100, 0, 0};
-    require(GranularEngine::choosePitch(choices, 0.25f) == -12 && GranularEngine::choosePitch(choices, 0.75f) == 7,
-            "Overfull probabilities not normalized");
+    require(GranularEngine::choosePitch(choices, 0.25f) == -12 && GranularEngine::choosePitch(choices, 0.75f) == -12,
+            "Overfull allocations stole existing fraction shares");
     // Confirm playback pitch in the actual wet signal, including octave extremes.
     for (float semitones : {-24.0f, -12.0f, 12.0f, 24.0f})
     {

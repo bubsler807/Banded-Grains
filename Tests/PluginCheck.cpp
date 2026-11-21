@@ -23,6 +23,8 @@ void pumpMessages(int milliseconds)
 void check(bool condition, const char* message)
 { if (!condition) throw std::runtime_error(message); }
 
+void check(bool condition, const std::string& message) { if (!condition) throw std::runtime_error(message); }
+
 juce::Component* findComponent(juce::Component& root, const juce::String& id)
 {
     if (root.getComponentID() == id) return &root;
@@ -448,11 +450,247 @@ void checkRandomAndEffects(bool previews)
     std::cout << "Random, ordered effect lanes, picker, scrolling, EQ response, bypass and state recall passed\n";
 }
 
+void checkGrainFractions(bool preview)
+{
+    auto render = [](int assignedGroup, bool distortion, bool reverb, bool eq)
+    {
+        GranularProcessor processor;
+        processor.setValue("fractions", 4);
+        processor.setValue("mix", 100); processor.setValue("density", 30);
+        for (int group = 0; group < 4; ++group)
+            processor.setValue("chance" + juce::String(group), group == assignedGroup ? 100.0f : 0.0f);
+        processor.setValue("fraction1_drive", 24); processor.setValue("fraction1_distMix", distortion ? 100.0f : 0.0f);
+        processor.setValue("fraction1_reverb", reverb ? 100.0f : 0.0f); processor.setValue("fraction1_room", 80);
+        processor.setValue("fraction1_low", eq ? 12.0f : 0.0f);
+        processor.setPlayConfigDetails(1, 1, 48000, 256); processor.prepareToPlay(48000, 256);
+        std::vector<float> result(48000 * 3);
+        juce::MidiBuffer midi;
+        for (int offset = 0; offset < static_cast<int>(result.size()); offset += 256)
+        {
+            const int count = juce::jmin(256, static_cast<int>(result.size()) - offset);
+            juce::AudioBuffer<float> audio(1, count);
+            for (int i = 0; i < count; ++i)
+                audio.setSample(0, i, offset + i < 19200 ? 0.05f * std::sin(juce::MathConstants<float>::twoPi * 100 * (offset + i) / 48000) : 0);
+            if (offset > 57600) processor.setValue("chance0", 0);
+            processor.processBlock(audio, midi);
+            for (int i = 0; i < count; ++i)
+            {
+                const float sample = audio.getSample(0, i);
+                check(std::isfinite(sample) && std::abs(sample) < 4, "Unstable grain fraction effects");
+                result[offset + i] = sample;
+            }
+        }
+        processor.releaseResources();
+        return result;
+    };
+    const auto plain = render(1, false, false, false);
+    const auto unusedEffects = render(1, true, true, true);
+    const auto distorted = render(0, true, false, false);
+    const auto equalized = render(0, false, false, true);
+    const auto reverberant = render(0, false, true, false);
+    double difference = 0, plainEnergy = 0, eqEnergy = 0, tail = 0;
+    for (size_t i = 0; i < plain.size(); ++i)
+    {
+        check(std::abs(plain[i] - unusedEffects[i]) < 0.000001f, "Fraction FX leaked into grains assigned to another group");
+        difference += std::abs(plain[i] - distorted[i]);
+        plainEnergy += plain[i] * plain[i]; eqEnergy += equalized[i] * equalized[i];
+        if (i > 72000) tail += reverberant[i] * reverberant[i];
+    }
+    check(difference > 1 && eqEnergy > plainEnergy * 3, "Fraction distortion or EQ did not process assigned grains");
+    check(tail > 0.000001, "Fraction reverb tail stopped after its percentage was set to zero");
+    GranularProcessor processor;
+    for (int group = 0; group < 4; ++group)
+        check(processor.value("pitch" + juce::String(group)) == 0, "New fractions unexpectedly pitch-shifted grains by default");
+    processor.setValue("fractions", 3); processor.setValue("m12_fractions", 3);
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditorIfNeeded());
+    auto* fraction = dynamic_cast<juce::TextButton*>(findComponent(*editor, "fraction2"));
+    check(fraction != nullptr, "Fraction effect selector missing"); fraction->onClick();
+    auto* reverb = dynamic_cast<juce::Slider*>(findComponent(*editor, "fractionFx2"));
+    check(reverb && reverb->isVisible(), "Fraction effect editor did not open");
+    reverb->setValue(65, juce::sendNotificationSync);
+    check(processor.value("fraction3_reverb") == 65 && processor.value("fraction1_reverb") == 0,
+          "Fraction editor changed the wrong fraction");
+    auto* moduleTwelve = dynamic_cast<juce::TextButton*>(findComponent(*editor, "module11")); moduleTwelve->onClick();
+    reverb->setValue(40, juce::sendNotificationSync);
+    check(processor.value("m12_fraction3_reverb") == 40 && processor.value("fraction3_reverb") == 65,
+          "Fraction settings leaked between modules");
+    auto* fxInput = findComponent(*editor, "modInput40"); // Fraction 3 reverb.
+    check(fxInput && fxInput->isVisible(), "Fraction effect modulation socket missing");
+    juce::MemoryBlock state; processor.getStateInformation(state);
+    processor.setValue("m12_fraction3_reverb", 0);
+    processor.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    check(processor.value("m12_fraction3_reverb") == 40, "Fraction effect settings did not recall");
+    auto legacy = juce::ValueTree::fromXml(*juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize())));
+    for (int i = legacy.getNumChildren(); --i >= 0;)
+        if (legacy.getChild(i).getProperty("id").toString().contains("fraction")) legacy.removeChild(i, nullptr);
+    juce::MemoryBlock oldState; juce::AudioProcessor::copyXmlToBinary(*legacy.createXml(), oldState);
+    processor.setStateInformation(oldState.getData(), static_cast<int>(oldState.getSize()));
+    check(processor.value("m12_fraction3_reverb") == 0 && processor.value("fraction3_reverb") == 0,
+          "Older pitch-only patches inherited fraction effects");
+    processor.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    if (preview)
+    {
+        auto* list = dynamic_cast<juce::Viewport*>(findComponent(*editor, "fractionList"));
+        if (list != nullptr) list->setViewPosition(0, 88);
+        juce::FileOutputStream stream(juce::File::getCurrentWorkingDirectory().getChildFile("dist/fractions-preview.png"));
+        stream.setPosition(0); stream.truncate();
+        juce::PNGImageFormat png; png.writeImageToStream(editor->createComponentSnapshot(editor->getLocalBounds()), stream);
+    }
+    std::cout << "Grain fraction allocation, effect isolation, tails, editing and state recall passed\n";
+}
+
+void checkFractionListAndAllWiring()
+{
+    GranularProcessor processor;
+    std::unique_ptr<juce::AudioProcessorEditor> editor(processor.createEditorIfNeeded());
+    auto* add = dynamic_cast<juce::TextButton*>(findComponent(*editor, "addFraction"));
+    check(add && processor.activeFractions(0) == 0, "Fraction list did not start empty");
+    add->onClick(); add->onClick(); add->onClick();
+    check(processor.activeFractions(0) == 3, "Add fraction did not append list rows");
+    processor.setFractionShare(0, 0, 60); processor.setFractionShare(0, 1, 30);
+    processor.setFractionShare(0, 2, 50);
+    check(processor.value("chance0") == 60 && processor.value("chance1") == 30 && processor.value("chance2") == 10,
+          "Share cap redistributed existing fractions or exceeded 100 percent");
+    auto* share = dynamic_cast<juce::Slider*>(findComponent(*editor, "chance2"));
+    check(share->snapValue(90, juce::Slider::notDragging) == 10, "User drag/text entry could exceed the available share");
+    processor.setFractionShare(0, 0, 20);
+    check(processor.value("chance1") == 30 && processor.value("chance2") == 10 && processor.availableFractionShare(0, 2) == 50,
+          "Lowering one share changed another fraction");
+    processor.setValue("fraction3_reverb", 45);
+    processor.setValue("modCount", 1); processor.setValue("mod1_connections", 2);
+    processor.setValue("mod1_link1_module", 0); processor.setValue("mod1_link1_target", GranularProcessor::fractionTarget(1, 1));
+    processor.setValue("mod1_link2_module", 0); processor.setValue("mod1_link2_target", GranularProcessor::fractionTarget(2, 4));
+    processor.removeFraction(0, 1);
+    check(processor.activeFractions(0) == 2 && processor.value("chance0") == 20 && processor.value("chance1") == 10,
+          "Remove fraction redistributed surviving shares");
+    check(processor.value("fraction2_reverb") == 45 && processor.value("mod1_connections") == 1
+          && processor.value("mod1_link1_target") == GranularProcessor::fractionTarget(1, 4), "Removal did not preserve settings/remap surviving cables");
+    for (int module = 0; module < GranularProcessor::maxBands; ++module)
+        while (processor.activeFractions(module) < GranularProcessor::fractionCount) processor.addFraction(module);
+    for (int module = 0; module < GranularProcessor::maxBands; ++module)
+        for (int group = 0; group < GranularProcessor::fractionCount; ++group)
+            processor.setValue(GranularProcessor::moduleID(module, "chance" + juce::String(group)), 0);
+    processor.addFraction(0);
+    check(processor.activeFractions(0) == GranularProcessor::fractionCount, "Fraction limit was exceeded");
+    processor.setValue("modCount", GranularProcessor::maxModulators);
+    for (int source = 0; source < GranularProcessor::maxModulators; ++source)
+    {
+        processor.setValue(GranularProcessor::modID(source, "wave"), 3);
+        processor.setValue(GranularProcessor::modID(source, "connections"), 0);
+    }
+    // Recreate the editor after setup to ensure all list rows and outputs bind correctly on reopen.
+    processor.editorBeingDeleted(editor.get());
+    editor.reset(); editor.reset(processor.createEditorIfNeeded());
+    check(editor != nullptr, "Editor did not reopen");
+    auto* list = dynamic_cast<juce::Viewport*>(findComponent(*editor, "fractionList"));
+    check(list != nullptr, "Scrollable fraction list missing");
+    auto point = [&](juce::Component* component) { return editor->getLocalArea(component, component->getLocalBounds()).getCentre().toFloat(); };
+    auto eventAt = [&](juce::Component* source, juce::Point<float> position)
+    {
+        const auto now = juce::Time::getCurrentTime();
+        return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(), source->getLocalPoint(editor.get(), position),
+            juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier), 1, 0, 0, 0, 0, source, source, now, {}, now, 1, true);
+    };
+    processor.setPlayConfigDetails(2, 2, 48000, 64); processor.prepareToPlay(48000, 64);
+    int tested = 0;
+    for (int sourceIndex = 0; sourceIndex < GranularProcessor::maxModulators; ++sourceIndex)
+        for (int target = 0; target < GranularProcessor::modTargetCount; ++target)
+        {
+            for (int source = 0; source < GranularProcessor::maxModulators; ++source)
+                processor.setValue(GranularProcessor::modID(source, "connections"), 0);
+            const int module = target % GranularProcessor::maxBands;
+            auto* output = findComponent(*editor, "modOutput" + juce::String(sourceIndex));
+            check(output && output->isVisible(), "Missing modulation output icon");
+            output->mouseDown(eventAt(output, point(output)));
+            auto* tab = findComponent(*editor, "module" + juce::String(module));
+            output->mouseDrag(eventAt(output, point(tab)));
+            const int group = GranularProcessor::targetFraction(target);
+            const int control = GranularProcessor::targetFractionControl(target);
+            if (group >= 0 && control >= 2)
+            {
+                list->setViewPosition(0, group * 44);
+                auto* button = findComponent(*editor, "fraction" + juce::String(group));
+                output->mouseDrag(eventAt(output, point(button)));
+            }
+            else
+            {
+                auto* page = findComponent(*editor, target >= 16 && target < 22 ? "playbackPage" : "grainsPage");
+                output->mouseDrag(eventAt(output, point(page)));
+                if (group >= 0) list->setViewPosition(0, group * 44);
+            }
+            auto* input = findComponent(*editor, "modInput" + juce::String(target));
+            check(input && input->isVisible(), "Missing visible modulation input: " + juce::String(target).toStdString());
+            output->mouseDrag(eventAt(output, point(input))); output->mouseUp(eventAt(output, point(input)));
+            check(processor.value(GranularProcessor::modID(sourceIndex, "connections")) == 1
+                  && processor.value(GranularProcessor::connectionID(sourceIndex, 0, "module")) == module
+                  && processor.value(GranularProcessor::connectionID(sourceIndex, 0, "target")) == target,
+                  "Patch drag routed to the wrong control: " + juce::String(target).toStdString());
+            processor.setValue(GranularProcessor::connectionID(sourceIndex, 0, "depth"), 10);
+            juce::AudioBuffer<float> audio(2, 64); audio.clear(); juce::MidiBuffer midi;
+            processor.processBlock(audio, midi);
+            auto* parameter = processor.parameters.getParameter(GranularProcessor::moduleID(module, GranularProcessor::modTargets[target]));
+            const auto range = parameter->getNormalisableRange();
+            const float base = processor.value(GranularProcessor::moduleID(module, GranularProcessor::modTargets[target]));
+            const float expected = range.snapToLegalValue(juce::jlimit(range.start, range.end,
+                base + processor.modulationOutput(sourceIndex) * processor.value(GranularProcessor::connectionID(sourceIndex, 0, "depth")) * 0.01f * (range.end - range.start)));
+            check(std::abs(processor.liveValue(module, target) - expected) < 0.002f,
+                  "Wired control did not receive modulation: " + juce::String(target).toStdString() + " actual=" + juce::String(processor.liveValue(module, target)).toStdString() + " expected=" + juce::String(expected).toStdString() + " count=" + juce::String(processor.activeFractions(module)).toStdString());
+            check(processor.value(GranularProcessor::moduleID(module, GranularProcessor::modTargets[target])) == base,
+                  "Modulation overwrote the destination's base setting");
+            ++tested;
+        }
+    processor.releaseResources();
+    for (int module = 0; module < GranularProcessor::maxBands; ++module)
+        check(findComponent(*editor, "moduleInput" + juce::String(module)) != nullptr, "Module input icon missing");
+    for (int source = 0; source < GranularProcessor::maxModulators; ++source)
+        processor.setValue(GranularProcessor::modID(source, "connections"), 0);
+    auto* sourceSocket = findComponent(*editor, "modOutput0");
+    auto* grainsPage = dynamic_cast<juce::TextButton*>(findComponent(*editor, "grainsPage"));
+    grainsPage->onClick();
+    for (int module = 0; module < GranularProcessor::maxBands; ++module)
+    {
+        processor.setValue("mod1_connections", 1); processor.setValue("mod1_link1_module", static_cast<float>(module));
+        processor.setValue("mod1_link1_target", 0);
+        auto* proxy = findComponent(*editor, "moduleInput" + juce::String(module));
+        const auto before = editor->createComponentSnapshot(editor->getLocalBounds());
+        proxy->mouseEnter(eventAt(proxy, point(proxy)));
+        const auto hovered = editor->createComponentSnapshot(editor->getLocalBounds());
+        const auto start = point(sourceSocket).roundToInt();
+        int changed = 0;
+        for (int y = start.y - 40; y < start.y - 8; ++y)
+            for (int x = start.x - 40; x < start.x + 40; ++x)
+                if (before.getPixelAt(x, y) != hovered.getPixelAt(x, y)) ++changed;
+        check(changed > 10, "Module input hover did not reveal incoming cables");
+        proxy->mouseExit(eventAt(proxy, point(proxy)));
+        proxy->mouseDown(eventAt(proxy, point(proxy)));
+        check(dynamic_cast<juce::TextButton*>(findComponent(*editor, "module" + juce::String(module)))->getToggleState(),
+              "Module socket did not open its module");
+        proxy->mouseExit(eventAt(proxy, point(proxy)));
+    }
+    processor.setValue("mod1_connections", 0);
+    auto* effects = dynamic_cast<juce::TextButton*>(findComponent(*editor, "effectsPage"));
+    auto* hiddenRow = findComponent(*editor, "fraction0"); list->setViewPosition(0, 0);
+    const auto hiddenPoint = point(hiddenRow);
+    effects->onClick();
+    sourceSocket->mouseDown(eventAt(sourceSocket, point(sourceSocket)));
+    sourceSocket->mouseDrag(eventAt(sourceSocket, hiddenPoint));
+    sourceSocket->mouseUp(eventAt(sourceSocket, hiddenPoint));
+    check(effects->getToggleState() && processor.value("mod1_connections") == 0,
+          "Hidden fraction rows intercepted a cable drag");
+    grainsPage->onClick();
+    sourceSocket->mouseDown(eventAt(sourceSocket, point(sourceSocket)));
+    sourceSocket->mouseDrag(eventAt(sourceSocket, {1090, 10})); sourceSocket->mouseUp(eventAt(sourceSocket, {1090, 10}));
+    check(processor.value("mod1_connections") == 0, "Dropping a cable on empty space created a connection");
+    std::cout << "Audited " << tested << " output-to-input routes, all module sockets, scrolled fraction rows and DSP destinations\n";
+}
+
 int runChecks(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI initialise;
     if (argc < 2) return 1;
     checkRandomAndEffects(argc > 2);
+    checkGrainFractions(argc > 2);
+    checkFractionListAndAllWiring();
     checkModulationContributions();
     checkAutomatedBandLayout();
     checkCrossovers();
@@ -754,7 +992,7 @@ int runChecks(int argc, char** argv)
             output->mouseDrag(cableEvent(tab->getBounds().getCentre().toFloat()));
         }
         auto* input = findComponent(*editor, "modInput" + juce::String(target));
-        const auto end = input->getBounds().getCentre().toFloat();
+        const auto end = editor->getLocalArea(input, input->getLocalBounds()).getCentre().toFloat();
         output->mouseDrag(cableEvent(end)); output->mouseUp(cableEvent(end));
     };
     patch(5, -1); // Module 12 feedback.

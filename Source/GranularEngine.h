@@ -10,7 +10,13 @@ class GranularEngine
 {
 public:
     struct Playback { float positionMs = 150, sprayMs = 200, pitch = 0, reverse = 0, spread = 0; bool freeze = false; };
-    struct GrainVisual { float position = 0, progress = 0, amplitude = 0, speed = 0; };
+    struct GrainVisual { float position = 0, progress = 0, amplitude = 0, speed = 0; int group = -1; };
+    static constexpr int groupCount = 12, groupCapacity = 256;
+    struct GroupOutput
+    {
+        std::array<std::array<std::array<float, groupCapacity>, 2>, groupCount> audio {};
+        std::array<float, groupCapacity> mix {};
+    };
     struct VisualState { std::array<GrainVisual, 32> grains {}; float recordHead = 0; };
     VisualState visualState() const
     {
@@ -23,23 +29,30 @@ public:
             if (grain.length == 0) continue;
             const float phase = static_cast<float>(grain.age) / (grain.length - 1);
             state.grains[i] = {static_cast<float>(grain.position / bufferSize), phase,
-                envelope(phase, grain.fade, grain.release), grain.speed};
+                envelope(phase, grain.fade, grain.release), grain.speed, grain.group};
         }
         return state;
     }
-    struct PitchChoices { std::array<float, 4> semitones {}, chances {}; };
+    struct PitchChoices { std::array<float, groupCount> semitones {}, chances {}; };
+    static int chooseGroup(const PitchChoices& choices, float random)
+    {
+        float selection = std::clamp(random, 0.0f, 0.99999994f) * 100.0f;
+        float remaining = 100;
+        for (int i = 0; i < groupCount; ++i)
+        {
+            const float share = std::clamp(choices.chances[i], 0.0f, remaining);
+            selection -= share;
+            if (selection < 0) return i;
+            remaining -= share;
+        }
+        return -1;
+    }
     static float choosePitch(const PitchChoices& choices, float random)
     {
-        float total = 0;
-        for (float chance : choices.chances) total += std::clamp(chance, 0.0f, 100.0f);
-        float selection = random * std::max(100.0f, total);
-        for (int i = 0; i < 4; ++i)
-        {
-            selection -= std::clamp(choices.chances[i], 0.0f, 100.0f);
-            if (selection < 0) return std::clamp(choices.semitones[i], -24.0f, 24.0f);
-        }
-        return 0;
+        const int group = chooseGroup(choices, random);
+        return group < 0 ? 0 : std::clamp(choices.semitones[group], -24.0f, 24.0f);
     }
+    void clearGrains() { grains = {}; samplesUntilGrain = 0; }
     void prepare(double newSampleRate)
     {
         sampleRate = newSampleRate;
@@ -65,9 +78,11 @@ public:
     void process(float* const* channels, int channelCount, int sampleCount,
                  float grainMilliseconds, float density, float mix, float shape = 0.0f, float releaseShape = -1.0f,
                  const PitchChoices* pitches = nullptr, float feedback = 0.0f,
-                 float repeatMilliseconds = 350.0f, float dampingHz = 6000.0f, const Playback* playback = nullptr)
+                 float repeatMilliseconds = 350.0f, float dampingHz = 6000.0f, const Playback* playback = nullptr,
+                 GroupOutput* groupOutput = nullptr)
     {
         if (bufferSize == 0) return;
+        if (sampleCount > groupCapacity) groupOutput = nullptr;
         const Playback settings = playback != nullptr ? *playback : Playback {};
         const int length = std::clamp(static_cast<int>(sampleRate * grainMilliseconds * 0.001),
                                       2, static_cast<int>(sampleRate * 0.25));
@@ -97,10 +112,12 @@ public:
                         randomState = randomState * 1664525u + 1013904223u;
                         const float random = static_cast<float>(randomState >> 8) / 16777216.0f;
                         float pitch = 0;
+                        int group = -1;
                         if (pitches != nullptr)
                         {
                             randomState = randomState * 1664525u + 1013904223u;
-                            pitch = choosePitch(*pitches, static_cast<float>(randomState >> 8) / 16777216.0f);
+                            group = chooseGroup(*pitches, static_cast<float>(randomState >> 8) / 16777216.0f);
+                            if (group >= 0) pitch = std::clamp(pitches->semitones[group], -24.0f, 24.0f);
                         }
                         pitch = std::clamp(pitch + settings.pitch, -36.0f, 36.0f);
                         float speed = std::pow(2.0f, pitch / 12.0f);
@@ -115,7 +132,7 @@ public:
                         const int maximumDelay = bufferSize - length - (speed < 0 ? travel : 0) - 2;
                         const int delay = std::clamp(safeDelay + static_cast<int>(sampleRate * offset * 0.001), 2, maximumDelay);
                         grain = { static_cast<double>((writePosition - delay + bufferSize) % bufferSize), 0, length, fade, release, speed,
-                            std::sqrt(1 - pan), std::sqrt(1 + pan) };
+                            std::sqrt(1 - pan), std::sqrt(1 + pan), group };
                         break;
                     }
                 samplesUntilGrain += interval;
@@ -123,6 +140,7 @@ public:
             --samplesUntilGrain;
 
             std::array<float, 2> wet {};
+            std::array<std::array<float, 2>, groupCount> groupWet {};
             for (auto& grain : grains)
                 if (grain.length != 0)
                 {
@@ -132,8 +150,12 @@ public:
                     const int lo = static_cast<int>(grain.position), hi = (lo + 1) % bufferSize;
                     const float fraction = static_cast<float>(grain.position - lo);
                     for (int ch = 0; ch < channelCount; ++ch)
-                        wet[ch] += (history[ch][lo] + fraction * (history[ch][hi] - history[ch][lo])) * window
+                    {
+                        const float value = (history[ch][lo] + fraction * (history[ch][hi] - history[ch][lo])) * window
                             * (channelCount == 1 ? 1 : ch == 0 ? grain.leftGain : grain.rightGain);
+                        wet[ch] += value;
+                        if (grain.group >= 0) groupWet[grain.group][ch] += value;
+                    }
                     grain.position += grain.speed;
                     if (grain.position >= bufferSize) grain.position -= bufferSize;
                     if (grain.position < 0) grain.position += bufferSize;
@@ -143,6 +165,13 @@ public:
             // Conservative gain compensation for overlapping grains; not a limiter.
             smoothedGain += mixStep * (gain - smoothedGain);
             smoothedMix += mixStep * (mix - smoothedMix);
+            if (groupOutput != nullptr)
+            {
+                groupOutput->mix[sample] = smoothedMix;
+                for (int group = 0; group < groupCount; ++group)
+                    for (int ch = 0; ch < channelCount; ++ch)
+                        groupOutput->audio[group][ch][sample] = groupWet[group][ch] * smoothedGain;
+            }
             smoothedFeedback += mixStep * (feedback - smoothedFeedback);
             smoothedDelay += mixStep * (targetDelay - smoothedDelay);
             smoothedDamping += mixStep * (damping - smoothedDamping);
@@ -174,7 +203,7 @@ public:
         return 1.0f;
     }
 private:
-    struct Grain { double position = 0; int age = 0, length = 0; float fade = 0.5f, release = 0.5f, speed = 1, leftGain = 1, rightGain = 1; };
+    struct Grain { double position = 0; int age = 0, length = 0; float fade = 0.5f, release = 0.5f, speed = 1, leftGain = 1, rightGain = 1; int group = -1; };
     std::array<Grain, 32> grains {};
     std::array<std::vector<float>, 2> history;
     std::array<std::vector<float>, 2> feedbackHistory;

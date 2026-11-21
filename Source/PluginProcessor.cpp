@@ -14,6 +14,12 @@ GranularProcessor::GranularProcessor()
                         parameters.getRawParameterValue(moduleID(m, "shape")),
                         parameters.getRawParameterValue(moduleID(m, "release")) };
         routeControls[m] = parameters.getRawParameterValue("route" + juce::String(m));
+        for (int group = 0; group < fractionCount; ++group)
+        {
+            for (int i = 0; i < fractionControlCount; ++i)
+                fractionParameters[m][group][i] = parameters.getRawParameterValue(fractionID(m, group, fractionControls[i]));
+            for (auto& effect : fractionEffects[m][group]) effect = std::make_unique<EffectSlot>();
+        }
         for (int i = 0; i < 6; ++i) playbackControls[m][i] = parameters.getRawParameterValue(moduleID(m, modTargets[16 + i]));
         feedbackControls[m] = {parameters.getRawParameterValue(moduleID(m, "feedback")),
             parameters.getRawParameterValue(moduleID(m, "repeat")), parameters.getRawParameterValue(moduleID(m, "damping"))};
@@ -31,7 +37,8 @@ GranularProcessor::GranularProcessor()
                 modConnections[slot][link] = {connection("module"), connection("target"), connection("depth")};
             }
         }
-        for (int i = 0; i < 4; ++i)
+        fractionCounts[m] = parameters.getRawParameterValue(moduleID(m, "fractions"));
+        for (int i = 0; i < fractionCount; ++i)
         {
             pitchControls[m][i] = parameters.getRawParameterValue(moduleID(m, "pitch" + juce::String(i)));
             chanceControls[m][i] = parameters.getRawParameterValue(moduleID(m, "chance" + juce::String(i)));
@@ -82,6 +89,7 @@ void GranularProcessor::prepareToPlay(double rate, int)
     for (int m = 0; m < maxBands; ++m)
     {
         engines[m].prepare(rate);
+        for (auto& group : fractionEffects[m]) for (auto& effect : group) effect->prepare(rate);
         moduleSoloGains[m].reset(rate, 0.01);
         moduleSoloGains[m].setCurrentAndTargetValue(soloedModule() < 0 || soloedModule() == m ? 1.0f : 0.0f);
         moduleAudio[m].setSize(2, chunkSize);
@@ -108,6 +116,14 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
         for (int slot = 0; slot < maxEffectsPerLane; ++slot)
             if (resetAllEffects || (resets & (1u << slot)) != 0) effectSlots[lane][slot]->reset();
     }
+    if (resetAllEffects)
+        for (auto& module : fractionEffects) for (auto& group : module) for (auto& effect : group) effect->reset();
+    for (int m = 0; m < maxBands; ++m)
+        if (resetFractionRouting[m].exchange(false))
+        {
+            engines[m].clearGrains();
+            for (auto& group : fractionEffects[m]) for (auto& effect : group) effect->reset();
+        }
     const int channels = getTotalNumInputChannels();
     const int bands = juce::jlimit(1, maxBands, juce::roundToInt(countControl->load()));
     if (bands != processedBandCount)
@@ -221,8 +237,10 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
             std::array<float, modTargetCount> values {controls[m].size->load(), controls[m].density->load(),
                 controls[m].mix->load(), controls[m].shape->load(), controls[m].release->load(),
                 feedbackControls[m][0]->load(), feedbackControls[m][1]->load(), feedbackControls[m][2]->load()};
-            for (int i = 0; i < 4; ++i) { values[8 + i] = pitchControls[m][i]->load(); values[12 + i] = chanceControls[m][i]->load(); }
+            for (int i = 0; i < fractionCount; ++i) { values[fractionTarget(i, 0)] = pitchControls[m][i]->load(); values[fractionTarget(i, 1)] = chanceControls[m][i]->load(); }
             for (int i = 0; i < 6; ++i) values[16 + i] = playbackControls[m][i]->load();
+            for (int group = 0; group < fractionCount; ++group)
+                for (int i = 0; i < fractionControlCount; ++i) values[fractionTarget(group, i + 2)] = fractionParameters[m][group][i]->load();
             std::array<float, modTargetCount> contributions {};
             for (int slot = 0; slot < activeModulators; ++slot)
             {
@@ -247,15 +265,27 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
             }
             GranularEngine::PitchChoices pitches;
             for (int target = 0; target < modTargetCount; ++target) liveValues[m][target].store(values[target]);
-            for (int i = 0; i < 4; ++i)
+            float remainingShare = 100;
+            const int activeGroups = juce::jlimit(0, fractionCount, juce::roundToInt(fractionCounts[m]->load()));
+            for (int i = 0; i < fractionCount; ++i)
             {
-                pitches.semitones[i] = values[8 + i];
-                pitches.chances[i] = values[12 + i];
+                pitches.semitones[i] = values[fractionTarget(i, 0)];
+                const float base = i < activeGroups ? juce::jlimit(0.0f, remainingShare, chanceControls[m][i]->load()) : 0;
+                pitches.chances[i] = i < activeGroups ? juce::jlimit(0.0f, base, values[fractionTarget(i, 1)]) : 0;
+                remainingShare -= pitches.chances[i];
             }
+            // Modulation may use unused capacity, but never takes another fraction's share.
+            for (int i = 0; i < activeGroups; ++i)
+            {
+                const float extra = juce::jlimit(0.0f, remainingShare, values[fractionTarget(i, 1)] - pitches.chances[i]);
+                pitches.chances[i] += extra; remainingShare -= extra;
+            }
+            for (int i = 0; i < fractionCount; ++i) liveValues[m][fractionTarget(i, 1)].store(pitches.chances[i]);
             const GranularEngine::Playback playback {values[16], values[17], values[18], values[19] * 0.01f, values[20] * 0.01f, values[21] >= 0.5f};
             engines[m].process(moduleAudio[m].getArrayOfWritePointers(), channels, length,
                 values[0], values[1], values[2] * 0.01f, values[3] * 0.01f,
-                values[4] * 0.01f, &pitches, values[5] * 0.01f, values[6], values[7], &playback);
+                values[4] * 0.01f, &pitches, values[5] * 0.01f, values[6], values[7], &playback, &fractionAudio);
+            processFractions(m, channels, length, values);
             // Keep every engine running so soloing preserves grain and feedback tails.
             for (int i = 0; i < length; ++i)
             {
@@ -276,6 +306,92 @@ void GranularProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
     {
         for (int m = 0; m < maxBands; ++m) grainVisualData[start1][m] = engines[m].visualState();
         grainVisualFifo.finishedWrite(1);
+    }
+}
+float GranularProcessor::availableFractionShare(int module, int group) const
+{
+    double used = 0;
+    for (int i = 0; i < activeFractions(module); ++i)
+        if (i != group) used += juce::jlimit(0.0f, 100.0f, value(moduleID(module, "chance" + juce::String(i))));
+    return static_cast<float>(juce::jmax(0.0, std::floor((100.0 - used) * 10 + 0.001) / 10));
+}
+void GranularProcessor::setFractionShare(int module, int group, float share)
+{
+    if (group < 0 || group >= activeFractions(module)) return;
+    setValue(moduleID(module, "chance" + juce::String(group)), juce::jlimit(0.0f, availableFractionShare(module, group), share));
+}
+void GranularProcessor::addFraction(int module)
+{
+    const int count = activeFractions(module);
+    if (count == fractionCount) return;
+    setValue(moduleID(module, "pitch" + juce::String(count)), 0);
+    setValue(moduleID(module, "chance" + juce::String(count)), 0);
+    for (const auto* control : fractionControls)
+    {
+        auto* parameter = parameters.getParameter(fractionID(module, count, control));
+        setValue(fractionID(module, count, control), parameter->convertFrom0to1(parameter->getDefaultValue()));
+    }
+    setValue(moduleID(module, "fractions"), static_cast<float>(count + 1));
+}
+void GranularProcessor::removeFraction(int module, int group)
+{
+    const int count = activeFractions(module);
+    if (group < 0 || group >= count) return;
+    for (int source = 0; source < maxModulators; ++source)
+    {
+        int links = juce::roundToInt(value(modID(source, "connections")));
+        for (int link = links; --link >= 0;)
+        {
+            if (juce::roundToInt(value(connectionID(source, link, "module"))) != module) continue;
+            const int target = juce::roundToInt(value(connectionID(source, link, "target")));
+            const int destination = targetFraction(target);
+            if (destination == group)
+            {
+                for (int i = link; i < links - 1; ++i)
+                    for (const auto* id : {"module", "target", "depth"})
+                        setValue(connectionID(source, i, id), value(connectionID(source, i + 1, id)));
+                setValue(modID(source, "connections"), static_cast<float>(--links));
+            }
+            else if (destination > group)
+                setValue(connectionID(source, link, "target"), static_cast<float>(fractionTarget(destination - 1, targetFractionControl(target))));
+        }
+    }
+    for (int i = group; i < count - 1; ++i)
+    {
+        setValue(moduleID(module, "pitch" + juce::String(i)), value(moduleID(module, "pitch" + juce::String(i + 1))));
+        setValue(moduleID(module, "chance" + juce::String(i)), value(moduleID(module, "chance" + juce::String(i + 1))));
+        for (const auto* control : fractionControls) setValue(fractionID(module, i, control), value(fractionID(module, i + 1, control)));
+    }
+    setValue(moduleID(module, "chance" + juce::String(count - 1)), 0);
+    for (const auto* control : fractionControls)
+    {
+        auto* parameter = parameters.getParameter(fractionID(module, count - 1, control));
+        setValue(fractionID(module, count - 1, control), parameter->convertFrom0to1(parameter->getDefaultValue()));
+    }
+    setValue(moduleID(module, "fractions"), static_cast<float>(count - 1));
+    resetFractionRouting[module].store(true);
+}
+void GranularProcessor::processFractions(int module, int channels, int samples, const std::array<float, modTargetCount>& values)
+{
+    for (int group = 0; group < fractionCount; ++group)
+    {
+        for (int ch = 0; ch < channels; ++ch) std::copy_n(fractionAudio.audio[group][ch].data(), samples, fractionScratch[ch].data());
+        const auto* p = values.data() + fractionTarget(group, 2);
+        auto* left = fractionScratch[0].data();
+        auto* right = channels > 1 ? fractionScratch[1].data() : nullptr;
+        EffectSlot::Settings settings;
+        settings.type = EffectSlot::equalizer; settings.enabled = p[5] != 0 || p[6] != 0 || p[7] != 0;
+        settings.lowDb = p[5]; settings.midDb = p[6]; settings.highDb = p[7]; settings.mix = 1;
+        fractionEffects[module][group][0]->process(left, right, samples, settings);
+        settings = {}; settings.type = EffectSlot::distortion; settings.driveDb = p[0];
+        settings.enabled = p[1] > 0; settings.mix = p[1] * 0.01f;
+        fractionEffects[module][group][1]->process(left, right, samples, settings);
+        settings = {}; settings.type = EffectSlot::reverb; settings.enabled = p[2] > 0;
+        settings.mix = p[2] * 0.01f; settings.room = p[3] * 0.01f; settings.damping = p[4] * 0.01f;
+        fractionEffects[module][group][2]->process(left, right, samples, settings);
+        for (int ch = 0; ch < channels; ++ch)
+            for (int i = 0; i < samples; ++i)
+                moduleAudio[module].addSample(ch, i, (fractionScratch[ch][i] - fractionAudio.audio[group][ch][i]) * fractionAudio.mix[i]);
     }
 }
 void GranularProcessor::processEffectLane(int lane, float* left, float* right, int samples)
@@ -458,6 +574,16 @@ double GranularProcessor::getTailLengthSeconds() const
             if (juce::roundToInt(modConnections[slot][link].target->load()) == 5 && modConnections[slot][link].depth->load() != 0)
                 return 900;
     double tail = 4.5;
+    for (int slot = 0; slot < count; ++slot)
+        for (int link = 0; link < juce::jlimit(0, maxConnections, juce::roundToInt(modControls[slot].connections->load())); ++link)
+        {
+            const int target = juce::roundToInt(modConnections[slot][link].target->load());
+            if (targetFraction(target) >= 0 && targetFractionControl(target) == 4 && modConnections[slot][link].depth->load() != 0)
+                tail = juce::jmax(tail, 64.5);
+        }
+    for (int m = 0; m < maxBands; ++m)
+        for (int group = 0; group < fractionCount; ++group)
+            if (fractionParameters[m][group][2]->load() > 0) tail = juce::jmax(tail, 64.5);
     // The maximum room setting can ring for tens of seconds.
     for (int lane = 0; lane < effectLaneCount; ++lane)
         for (int slot = 0; slot < effectCount(lane); ++slot)
@@ -498,6 +624,20 @@ void GranularProcessor::setStateInformation(const void* data, int bytes)
                         parameter->convertFrom0to1(parameter->getDefaultValue()), nullptr);
                 }
             };
+            for (int m = 0; m < maxBands; ++m)
+            {
+                const auto id = moduleID(m, "fractions");
+                if (!incoming.getChildWithProperty("id", id).isValid())
+                    restored.getChildWithProperty("id", id).setProperty("value", incoming.getChildWithProperty("id", moduleID(m, "chance0")).isValid() ? 4 : 0, nullptr);
+                for (int group = 4; group < fractionCount; ++group)
+                {
+                    restoreDefaultIfMissing(moduleID(m, "pitch" + juce::String(group)));
+                    restoreDefaultIfMissing(moduleID(m, "chance" + juce::String(group)));
+                }
+            }
+            for (int m = 0; m < maxBands; ++m)
+                for (int group = 0; group < fractionCount; ++group)
+                    for (const auto* control : fractionControls) restoreDefaultIfMissing(fractionID(m, group, control));
             for (int lane = 0; lane < effectLaneCount; ++lane)
             {
                 for (const auto* control : effectControls) restoreDefaultIfMissing(effectID(lane, control));
@@ -603,7 +743,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GranularProcessor::createPar
         for (int i = 0; i < 4; ++i)
         {
             layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{moduleID(m, "pitch" + juce::String(i)), 1},
-                "M" + juce::String(m + 1) + " Pitch " + juce::String(i + 1), -24, 24, std::array<int, 4>{-12, -7, 7, 12}[i]));
+                "M" + juce::String(m + 1) + " Pitch " + juce::String(i + 1), -24, 24, 0));
             layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{moduleID(m, "chance" + juce::String(i)), 1},
                 "M" + juce::String(m + 1) + " Chance " + juce::String(i + 1), juce::NormalisableRange<float>(0, 100, 0.1f), 0.0f));
         }
@@ -620,6 +760,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout GranularProcessor::createPar
     juce::StringArray targets {"Grain size", "Density", "Dry / Wet", "Attack slope", "Release slope", "Feedback", "Repeat time", "Damping",
         "Pitch 1", "Pitch 2", "Pitch 3", "Pitch 4", "Chance 1", "Chance 2", "Chance 3", "Chance 4",
         "Position", "Spray", "Base pitch", "Reverse chance", "Stereo spread", "Freeze"};
+    for (int group = 0; group < 4; ++group)
+        for (const auto* control : fractionControls) targets.add("Fraction " + juce::String(group + 1) + " " + control);
+
+    for (int group = 4; group < fractionCount; ++group)
+    {
+        targets.add("Fraction " + juce::String(group + 1) + " pitch");
+        targets.add("Fraction " + juce::String(group + 1) + " share");
+        for (const auto* control : fractionControls) targets.add("Fraction " + juce::String(group + 1) + " " + control);
+    }
     {
         layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"modCount", 1},
             "Modulators", 0, maxModulators, 0));
@@ -715,6 +864,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout GranularProcessor::createPar
             add(effectSlotID(lane, slot, "damping"), name + "Damping", 0, 100, 50, "%");
             add(effectSlotID(lane, slot, "width"), name + "Width", 0, 100, 100, "%");
             for (const auto* band : {"low", "mid", "high"}) add(effectSlotID(lane, slot, band), name + band, -18, 18, 0, "dB");
+        }
+    }
+    auto addFractionFx = [&](int m, int group)
+        {
+            const auto prefix = "M" + juce::String(m + 1) + " Fraction " + juce::String(group + 1) + " ";
+            const std::array<float, 8> lower {0, 0, 0, 0, 0, -18, -18, -18};
+            const std::array<float, 8> upper {36, 100, 100, 100, 100, 18, 18, 18};
+            const std::array<float, 8> initial {12, 0, 0, 50, 50, 0, 0, 0};
+            for (int i = 0; i < fractionControlCount; ++i)
+                layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{fractionID(m, group, fractionControls[i]), 1},
+                    prefix + fractionControls[i], juce::NormalisableRange<float>(lower[i], upper[i], 0.1f), initial[i],
+                    juce::AudioParameterFloatAttributes().withLabel(i == 0 || i >= 5 ? "dB" : "%")));
+        };
+    for (int m = 0; m < maxBands; ++m) for (int group = 0; group < 4; ++group) addFractionFx(m, group);
+    for (int m = 0; m < maxBands; ++m)
+    {
+        layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{moduleID(m, "fractions"), 1}, "M" + juce::String(m + 1) + " Fractions", 0, fractionCount, 0));
+        for (int group = 4; group < fractionCount; ++group)
+        {
+            layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{moduleID(m, "pitch" + juce::String(group)), 1}, "M" + juce::String(m + 1) + " Pitch " + juce::String(group + 1), -24, 24, 0));
+            layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{moduleID(m, "chance" + juce::String(group)), 1}, "M" + juce::String(m + 1) + " Chance " + juce::String(group + 1), juce::NormalisableRange<float>(0, 100, 0.1f), 0.0f));
+            addFractionFx(m, group);
         }
     }
     return layout;
