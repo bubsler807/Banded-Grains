@@ -1,6 +1,6 @@
 # Banded Grains
 
-Banded Grains is a multiband granular audio effect for Windows x64. It splits incoming audio into frequency bands and sends them to independent granular processors, so different parts of a sound can have their own grain timing, pitch, feedback, and modulation.
+Banded Grains is a multiband granular audio effect for Windows x64. It splits incoming audio into frequency bands and sends them to independent granular processors, so different parts of a sound can have their own grain timing, pitch, feedback, and modulation. Each processor can divide its grain stream into up to 12 fractions, each with its own percentage, pitch offset, EQ, distortion, and reverb.
 
 The plugin runs as a VST3 effect in a DAW and supports mono and stereo audio. It is built with C++17 and JUCE 8.0.12.
 
